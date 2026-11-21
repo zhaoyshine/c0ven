@@ -172,6 +172,8 @@ Model::Model(const std::string &path, const Options &opt) : opt_(opt), gguf_(pat
   if (!info_.ngram_in_ram) info_.ngram_read_us = ngram_->read_latency_us();
   for (uint32_t c = 0; c < ncards_; c++) info_.copy_bytes_per_s[c] = measure_copy(c);
   events_ = std::make_unique<ze::EventPool>(*rt_, shape_.layers * (2 * ncards_ + 2) + 1 + shape_.attn_layers() * ncards_);
+  // Alchemist: the cards do not see the host's flags, so the host synchronizes each layer's part.
+  layer_sync_ = !rt_->cards()[0].host_flag_polling;
 
   plan_ = static_cast<StepPlan *>(rt_->alloc_host(sizeof(StepPlan)));
   std::memset(plan_, 0, sizeof(StepPlan));
@@ -260,6 +262,7 @@ void Model::load_cards(bool first) {
     card->c = c;
     card->C = ncards_;
     card->up = std::make_unique<ze::List>(*rt_, c, ze::List::immediate);
+    if (layer_sync_) card->stepq = std::make_unique<ze::Queue>(*rt_, c);
     cards_.push_back(std::move(card));
   }
   std::fill(kvs_to_.begin(), kvs_to_.end(), 0);  // the ring starts empty
@@ -1186,7 +1189,9 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
   const uint32_t key = kvs ? W : W + kKvsSkipList;
   // Not in order: the launches between L.together(true) and L.together(false) read the same inputs and write their
   // own outputs, so they may run side by side; each other command waits for those before it.
-  auto list = std::make_unique<ze::List>(*rt_, card.c, ze::List::regular, false, false);
+  // layer_sync_: the parts go on one queue, and each ends at a layer's router, where the host reads the routing.
+  auto list = std::make_unique<ze::List>(*rt_, card.c, ze::List::regular, false, false,
+                                         layer_sync_ ? card.stepq.get() : nullptr);
   ze::List &L = *list;
   const uint32_t c = card.c, C = ncards_;
   auto common = [&](const char *name) { return kernel(c, rows_module("common", W), name); };
@@ -1364,6 +1369,10 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
     else
       L.launch(q4("router_group"), {card.rl, Ly.slot_map, card.x, card.ids, card.w, card.slots, nmiss, jobs, plan,
                                     card.groups, card.ngroups}, 1, 1, 1, group_wg(W));
+    L.together(false);
+    // The host reads this layer's routing next.
+    if (layer_sync_) L.split();
+    L.together(true);
     L.launch(q4("swiglu_a8"), {card.shg, card.shu, card.ff, plan, card.sha8}, (card.ff / 32 + 3) / 4, W, 1, 64);
     L.together(false);
     if (nslots_cached_ > 0) {
@@ -1400,7 +1409,8 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
     } else {
       matvec(L, card, Ly.sh_down, card.sha8, card.s, W, nrows);
     }
-    if (c == 0) L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
+    // With layer_sync_ the CPU's answers are written before this part is submitted.
+    if (c == 0 && !layer_sync_) L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
     float *p2 = ex2_ + l * ex_layer + (size_t)c * STEP_MAX_ROWS * shape_.embd;
     const float *cpu = c == 0 ? cpu_y_ + (size_t)l * STEP_MAX_ROWS * shape_.embd : nullptr;
     if (peer) {
@@ -1584,7 +1594,11 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
     if (first) set_rope(rows[r].slot, rows[r].pos, true);
   }
   for (uint32_t i = 0; i < events_->size(); i++) ZE_CHECK(zeEventHostReset((*events_)[i]));
-  for (uint32_t c = ncards_; c-- > 0;) cards_[c]->lists.at(key)->execute();
+  ze::List *card0_list = cards_[0]->lists.at(key).get();
+  if (layer_sync_)
+    for (auto &card : cards_) card->lists.at(key)->execute_part(0);
+  else
+    for (uint32_t c = ncards_; c-- > 0;) cards_[c]->lists.at(key)->execute();
   // The n-gram rows, all read at once while the cards run layer 0 (ADR-0015); they wait for the event before layer 1.
   {
     int32_t t[STEP_MAX_ROWS], p1[STEP_MAX_ROWS], p2[STEP_MAX_ROWS];
@@ -1598,18 +1612,22 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
   std::vector<float> xs((size_t)n * E);
   const uint32_t step = plan_->step;
   for (uint32_t l = 0; l < shape_.layers; l++) {
-    // The layer's records (ADR-0011): spin until card 0 publishes each row's for this step; then all the rows'
-    // misses at once, each expert's weights read once.
+    // The layer's records: the part ending at this layer's router, or card 0's publish of each row's, for this
+    // step; then all the rows' misses at once, each expert's weights read once.
+    // layer_sync_: once the part's fence is down, the routing is in host memory.
+    if (layer_sync_) card0_list->synchronize_part(l);
     jobs.clear();
     HostLayer &hl = *host_layers_[l];
     for (uint32_t r = 0; r < n; r++) {
       MissJob &J = jobs_[(size_t)l * STEP_MAX_ROWS + r];
-      std::atomic_ref<uint32_t> seq(J.seq);
-      auto t0 = std::chrono::steady_clock::now();
-      for (uint32_t k = 0; seq.load(std::memory_order_acquire) != step; k++) {
-        _mm_pause();
-        if ((k & 0xffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
-          throw std::runtime_error("card 0 did not publish layer " + std::to_string(l) + "'s experts");
+      if (!layer_sync_) {
+        std::atomic_ref<uint32_t> seq(J.seq);
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t k = 0; seq.load(std::memory_order_acquire) != step; k++) {
+          _mm_pause();
+          if ((k & 0xffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
+            throw std::runtime_error("card 0 did not publish layer " + std::to_string(l) + "'s experts");
+        }
       }
       const uint32_t nm = J.nmiss;
       if (opt_.adapt_swaps) note_routing(l, J.all, shape_.used, prompt ? kPromptRouting : 1.0f);
@@ -1617,14 +1635,22 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
       std::memcpy(xs.data() + (size_t)r * E, J.x, E * 4);
       for (uint32_t k = 0; k < nm; k++) jobs.push_back({hl.weights[J.ids[k]], r, J.w[k]});
     }
-    if (jobs.empty()) continue;
-    stats_.misses += (uint32_t)jobs.size();
-    stats_.layers_missed++;
-    cpu_->compute_many(hl.shape, jobs, n, xs.data(), E, cpu_y_ + (size_t)l * STEP_MAX_ROWS * E, E);
-    std::atomic_ref<uint32_t>(ans_seq_[16 * l]).store(step, std::memory_order_release);
+    if (!jobs.empty()) {
+      stats_.misses += (uint32_t)jobs.size();
+      stats_.layers_missed++;
+      cpu_->compute_many(hl.shape, jobs, n, xs.data(), E, cpu_y_ + (size_t)l * STEP_MAX_ROWS * E, E);
+      if (!layer_sync_) std::atomic_ref<uint32_t>(ans_seq_[16 * l]).store(step, std::memory_order_release);
+    }
+    // layer_sync_: submitted after the CPU's answers, so no kernel waits on the host.
+    if (layer_sync_)
+      for (auto &card : cards_) card->lists.at(key)->execute_part(l + 1);
   }
-  for (auto &card : cards_) card->lists.at(key)->synchronize();
-  if (*stuck_) throw std::runtime_error("card 0 gave up waiting for the CPU's experts");
+  if (layer_sync_) {
+    for (auto &card : cards_) card->lists.at(key)->synchronize_part(shape_.layers);
+  } else {
+    for (auto &card : cards_) card->lists.at(key)->synchronize();
+    if (*stuck_) throw std::runtime_error("card 0 gave up waiting for the CPU's experts");
+  }
   if (kvs) {
     // The claim may have taken any other slot's pages; a step's slot that read every cell is claimed through its
     // position and kKvsAhead pages past it (one past the indexer's width claimed only the cells it chose).

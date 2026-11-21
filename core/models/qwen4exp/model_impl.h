@@ -250,6 +250,7 @@ struct Model::Card {
   float *xp = nullptr;
   StepPlan *plan = nullptr;  // the step plan, copied from host memory by the decode step's first command
   std::unique_ptr<ze::List> up;
+  std::unique_ptr<ze::Queue> stepq;  // the decode step's parts, in submission order (Alchemist)
   std::map<uint32_t, std::unique_ptr<ze::List>> lists;  // the decode step, per width (kStepWidths)
   std::map<uint32_t, uint64_t *> trace;                 // their timestamps, with Options::trace
   std::unique_ptr<ze::List> commit;                     // a window's commit (CommitPlan)

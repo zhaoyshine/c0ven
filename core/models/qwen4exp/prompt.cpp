@@ -70,14 +70,23 @@ void Model::load_prompt(Card &card) {
   auto f32 = [&](uint64_t n) { return reinterpret_cast<float *>(dev(n * 4)); };
   auto u16 = [&](uint64_t n) { return reinterpret_cast<uint16_t *>(dev(n * 2)); };
   auto u32 = [&](uint64_t n) { return reinterpret_cast<uint32_t *>(dev(n * 4)); };
-  P.R = f32(T * shape_.hc_dim());
+  // The other card writes these exchange buffers with kernel stores (ADR-0030). Where the driver drops those
+  // (Alchemist), they live in host memory of the one context, which both cards reach.
+  const bool host_ex = !rt_->cards()[card.c].peer_kernel_access;
+  auto xdev = [&](uint64_t bytes) {
+    return static_cast<uint8_t *>(host_ex ? rt_->alloc_host(std::max<uint64_t>(bytes, 4096))
+                                          : rt_->alloc_device(card.c, std::max<uint64_t>(bytes, 256)));
+  };
+  auto xf32 = [&](uint64_t n) { return reinterpret_cast<float *>(xdev(n * 4)); };
+  auto xu16 = [&](uint64_t n) { return reinterpret_cast<uint16_t *>(xdev(n * 2)); };
+  P.R = xf32(T * shape_.hc_dim());
   P.inj[0] = f32(T * shape_.hc);
   P.inj[1] = f32(T * shape_.hc);
   P.lr = f32(T * lri_w(shape_));
   P.rr = f32(T * shape_.hc);
   P.lrb = u16(T * shape_.hc_lr);
-  P.x16 = u16(T * shape_.embd);
-  P.xb = u16(T * shape_.embd);
+  P.x16 = xu16(T * shape_.embd);
+  P.xb = xu16(T * shape_.embd);
   P.ab = f32(T * 2 * card.nvh);
   P.gb = f32(T * 2 * card.nvh);
   const uint64_t ow = std::max(card.nvh * shape_.gdn_d, card.nq * shape_.att_key);
@@ -153,8 +162,8 @@ void Model::load_prompt(Card &card) {
   P.shh = u16(T * card.ff);
   P.s = f32(T * shape_.embd);
   P.part = u16(T * shape_.embd);
-  P.recv[0] = u16(T * shape_.embd);
-  P.recv[1] = u16(T * shape_.embd);
+  P.recv[0] = xu16(T * shape_.embd);
+  P.recv[1] = xu16(T * shape_.embd);
   P.ub = u16(T * shape_.embd);
   P.pv = f32(T * shape_.embd);
   P.gates = f32(T * shape_.hc);
@@ -203,7 +212,10 @@ void Model::record_prompt_copy(Card &card) {
     // before the runtime's first copy fault again after it (ADR-0065). The zeros clobber the copy's bytes; nothing
     // reads the buffer before a chunk stages its experts over them.
     const auto t0 = std::chrono::steady_clock::now();
-    for (uint64_t off = 0; off < 2 * P.stage_slot; off += 4096) *(volatile uint8_t *)(P.stage_cpu + off) = 0;
+    for (uint64_t off = 0; off < 2 * P.stage_slot; off += 4096) {
+      *(volatile uint8_t *)(P.stage_cpu + off) = 0;
+      if (rt_->cards()[card.c].writeback_mapping) ze::flush_cpu_writes(P.stage_cpu + off, 1);
+    }
     _mm_sfence();
     std::fprintf(stderr, "engine: card %u: the staging buffer's %.2f GiB touched through the mapping in %.0f ms\n",
                  card.c, 2.0 * P.stage_slot / (1ull << 30),
@@ -217,7 +229,10 @@ void Model::record_prompt_copy(Card &card) {
       uint8_t *yg = reinterpret_cast<uint8_t *>(P.yg);
       for (uint64_t off = 0; off < bytes; off += piece) warm.copy(yg + off, hl.pieces[0], std::min(piece, bytes - off));
       warm.synchronize();
-      for (uint64_t off = 0; off < bytes; off += 4096) *(volatile uint8_t *)(P.yg_cpu + off) = 0;
+      for (uint64_t off = 0; off < bytes; off += 4096) {
+        *(volatile uint8_t *)(P.yg_cpu + off) = 0;
+        if (rt_->cards()[card.c].writeback_mapping) ze::flush_cpu_writes(P.yg_cpu + off, 1);
+      }
       _mm_sfence();
     }
   }
@@ -246,6 +261,12 @@ void Model::fetch_experts(uint32_t c, const std::vector<std::vector<uint32_t>> &
     std::memcpy(to, w.gate + f0 * hl.gate_row_bytes, half);
     std::memcpy(to + hl.stg_up_off, w.up + f0 * hl.gate_row_bytes, half);
     std::memcpy(to + hl.stg_down_off, w.down + d0, dpart);
+    if (rt_->cards()[card.c].writeback_mapping) {
+      // The mapping is write-back here: the card reads what the flush has pushed out (ze.h, writeback_mapping).
+      ze::flush_cpu_writes(to, half);
+      ze::flush_cpu_writes(to + hl.stg_up_off, half);
+      ze::flush_cpu_writes(to + hl.stg_down_off, dpart);
+    }
   };
   // Bounded as ze::List::synchronize is: a list whose engine was reset never signals.
   auto wait = [](ze_event_handle_t e) {
@@ -337,7 +358,10 @@ void Model::rare_experts() {
         ggml_fp32_to_fp16_row(y.data() + i * E, reinterpret_cast<ggml_fp16_t *>(y16.data() + i * E), E);
       });
       uint16_t *to = reinterpret_cast<uint16_t *>(P.yg_cpu);
-      for (const Rows &g : rows) std::memcpy(to + (size_t)g.base * E, y16.data() + (size_t)g.tok * E, (size_t)g.n * E * 2);
+      for (const Rows &g : rows) {
+        std::memcpy(to + (size_t)g.base * E, y16.data() + (size_t)g.tok * E, (size_t)g.n * E * 2);
+        if (rt_->cards()[0].writeback_mapping) ze::flush_cpu_writes(to + (size_t)g.base * E, (size_t)g.n * E * 2);
+      }
       // A full fence, as in fetch_experts: a store fence would not hold back the read behind the last writes.
       _mm_mfence();
       (void)*(volatile uint8_t *)(P.yg_cpu);  // returns once the writes before it have reached the card

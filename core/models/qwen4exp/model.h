@@ -356,6 +356,8 @@ class Model final : public engine::Model {
   std::unique_ptr<ze::Runtime> rt_;
   std::unique_ptr<ze::Library> lib_;
   std::unique_ptr<ze::EventPool> events_;
+  // Alchemist: the cards do not see the host's flags, so the host synchronizes each layer's part instead.
+  bool layer_sync_ = false;
   std::unique_ptr<Pool> pool_;
   std::unique_ptr<CpuExperts> cpu_;
   std::unique_ptr<Ngram> ngram_;
