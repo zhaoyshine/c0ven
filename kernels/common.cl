@@ -111,15 +111,43 @@ __kernel void to_bf16_rows(__global const float *x, uint x_stride, uint K, __glo
 // aligned; K, ldw multiples of 32. Groups ceil(N / 16), 16 ksplit (ksplit <= 64, K / ksplit a multiple of 16);
 // sub-group 0 adds the ksplit tiles in order. A tile's sums do not depend on the tiles after it.
 #define MV_TILES (STEP_ROWS / 8)
-REQD_SG __kernel void mv_xmx_bf16(__global const ushort *W, uint N, uint K, uint ldw, __global const ushort *xb,
-                                  __global const uint *ntok_p, __global float *y, uint y_stride, uint mode,
-                                  float scale, uint post_rows, uint ksplit, __global ushort *yb) {
+#ifdef ENGINE_DG2
+// The Alchemist form: sub-group 8, so the work-group's 16 * ksplit work-items are 2 * ksplit sub-groups. Sub-group s
+// takes column half s & 1 (rows n0 + 8 * (s & 1) .. +7) and K split s >> 1; sub-groups 0 and 1 add the ksplit tiles
+// of their half in order.
+#include "dg2.h"
+#define MV_KERNEL_SG REQD_SG8
+#else
+#define MV_KERNEL_SG REQD_SG
+#endif
+MV_KERNEL_SG __kernel void mv_xmx_bf16(__global const ushort *W, uint N, uint K, uint ldw,
+                                       __global const ushort *xb, __global const uint *ntok_p, __global float *y,
+                                       uint y_stride, uint mode, float scale, uint post_rows, uint ksplit,
+                                       __global ushort *yb) {
+#ifdef ENGINE_DG2
+  __local float red[128][8][SG8];
+#else
   __local float red[64][8][SG_SIZE];
+#endif
   const uint lane = sg_lane(), s = sg_id(), n0 = get_group_id(0) * 16, ntok = *ntok_p, tiles = (ntok + 7) / 8;
+#ifdef ENGINE_DG2
+  const uint chalf = s & 1, kq = s >> 1;
+  const uint kc = K / ksplit, k0 = kq * kc;
+#else
   const uint kc = K / ksplit, k0 = s * kc;
+#endif
   float8 acc[MV_TILES];
   __attribute__((opencl_unroll_hint)) for (uint t = 0; t < MV_TILES; t++) acc[t] = (float8)0.0f;
   for (uint k = k0; k < k0 + kc; k += 16) {
+#ifdef ENGINE_DG2
+    const int8 b = sg_load_b8(W, n0 + 8 * chalf, ldw, k, N, lane);
+    __attribute__((opencl_unroll_hint)) for (uint t = 0; t < MV_TILES; t++) {
+      if (t < tiles) {
+        const int8 a = sg_load_a8(xb, 8 * t, K, k, ntok, lane);
+        acc[t] = dpas8_bf16(a, b, acc[t]);
+      }
+    }
+#else
     uint b[8];
     sg_load_cols16(W, K * 2, N, ldw * 2, k / 2, n0, b);
     __attribute__((opencl_unroll_hint)) for (uint t = 0; t < MV_TILES; t++) {
@@ -129,22 +157,37 @@ REQD_SG __kernel void mv_xmx_bf16(__global const ushort *W, uint N, uint K, uint
         acc[t] = dpas_bf16(as_short8(vload8(0, a)), as_int8(vload8(0, b)), acc[t]);
       }
     }
+#endif
   }
+#ifdef ENGINE_DG2
+  const uint n = n0 + 8 * chalf + lane;
+#else
   const uint n = n0 + lane;
-  // After the last tile's sums are in red, only sub-group 0 has work left: the others leave, as their threads can
-  // then run other work-groups. Between tiles, red is read in full before the next tile's sums overwrite it.
+#endif
+  // After the last tile's sums are in red, only the sub-groups that add them have work left: the others leave, as
+  // their threads can then run other work-groups. Between tiles, red is read in full before the next tile's sums
+  // overwrite it.
   __attribute__((opencl_unroll_hint)) for (uint t = 0; t < MV_TILES; t++) {
     if (t >= tiles) break;
     float r[8];
     vstore8(acc[t], 0, r);
     for (uint m = 0; m < 8; m++) red[s][m][lane] = r[m];
     barrier(CLK_LOCAL_MEM_FENCE);
+#ifdef ENGINE_DG2
+    if (s > 1 && t + 1 == tiles) return;
+    if (s < 2)
+      for (uint m = 0; m < 8 && 8 * t + m < ntok; m++) {
+        const uint row = 8 * t + m;
+        float v = 0.0f;
+        for (uint q = 0; q < ksplit; q++) v += red[2 * q + chalf][m][lane];
+#else
     if (s != 0 && t + 1 == tiles) return;
     if (s == 0)
       for (uint m = 0; m < 8 && 8 * t + m < ntok; m++) {
         const uint row = 8 * t + m;
         float v = 0.0f;
         for (uint q = 0; q < ksplit; q++) v += red[q][m][lane];
+#endif
         if (n < post_rows) {
           v *= scale;
           if (mode == 1) v = silu(v);

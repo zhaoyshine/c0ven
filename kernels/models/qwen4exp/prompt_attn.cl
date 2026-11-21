@@ -26,6 +26,106 @@ static inline float sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
 // 2,048 cells are 512 whole blocks of 4 (the dense rows' cells are 0, 1, 2, ...), so a tile of 16 cells is mostly 4
 // runs of 4 positions. A work-group holds `rows` consecutive rows of hp / 8 sub-groups each, which share many cells
 // through the core's cache. Groups (1, ceil(T / rows)), 16 hp / 8 rows work-items (prompt.cpp: 16 sub-groups).
+#ifdef ENGINE_DG2
+// The Alchemist form: sub-group 8. A pair of sub-groups takes one row's 8 heads. Each computes the 16 cells' scores
+// over the full K in two 8-cell halves, so both hold the same probabilities, and takes half the output's dimensions:
+// 16 groups of 8, dim = 8 * (part * 16 + j) + lane. The V operand is gathered a half a lane: B[p] pairs cells 2p and
+// 2p + 1 for the lane's dimension.
+#include "dg2.h"
+REQD_SG8 __kernel void p_attn_xmx(__global const half *qt, __global const float *Q, __global const half *kh,
+                                  __global const half *vh, uint nq, uint hp, uint nkv, __global const uint *cells_all,
+                                  __global const uint *ncells, __global const PromptPlan *pp, __global half *o16) {
+  const uint lane = sg_lane(), sgi = get_sub_group_id(), part = sgi & 1, sg = sgi >> 1;
+  const uint hg = hp / 8, rows = get_num_sub_groups() / 2 / hg;
+  const uint t = rows * get_group_id(1) + sg / hg, h0 = 8 * (sg % hg);
+  if (t >= pp->n || pp->n <= PROMPT_SHORT_RUN || !hg) return;
+  const ulong r0 = pp->row0;
+  qt += r0 * Q_ATT_D * hp;
+  Q += r0 * nq * 2 * Q_ATT_D;
+  cells_all += r0 * Q_IDX_CELLS;
+  ncells += r0;
+  o16 += r0 * nq * Q_ATT_D;
+  const uint c = h0 / Q_ATT_SLOTS, hk0 = h0 % Q_ATT_SLOTS;
+  const uint n = ncells[t];
+  __global const uint *cells = cells_all + (ulong)t * Q_IDX_CELLS;
+  __global const ushort *q = (__global const ushort *)qt + (ulong)t * Q_ATT_D * hp + h0;
+  int8 qa[16];
+  for (uint k = 0; k < 16; k++) {
+    __global const ushort *qp = q + (ulong)(16 * k + 2 * lane) * hp;
+    const ushort8 v0 = vload8(0, qp), v1 = vload8(0, qp + hp);
+    qa[k] = (int8)((uint)v0.s0 | ((uint)v1.s0 << 16), (uint)v0.s1 | ((uint)v1.s1 << 16),
+                   (uint)v0.s2 | ((uint)v1.s2 << 16), (uint)v0.s3 | ((uint)v1.s3 << 16),
+                   (uint)v0.s4 | ((uint)v1.s4 << 16), (uint)v0.s5 | ((uint)v1.s5 << 16),
+                   (uint)v0.s6 | ((uint)v1.s6 << 16), (uint)v0.s7 | ((uint)v1.s7 << 16));
+  }
+  float8 o[16];
+  for (uint j = 0; j < 16; j++) o[j] = (float8)0.0f;
+  float8 mrow = (float8)(-INFINITY), lrow = (float8)0.0f;
+  for (uint i0 = 0; i0 < n; i0 += 16) {
+    const uint i1 = i0 + 8;
+    const bool val0 = i0 + lane < n, val1 = i1 + lane < n;
+    const uint c0 = cells[val0 ? i0 + lane : n - 1], c1 = cells[val1 ? i1 + lane : n - 1];
+    __global const uint *kr0 = (__global const uint *)(kh + ((ulong)c0 * nkv + c) * Q_ATT_D);
+    __global const uint *kr1 = (__global const uint *)(kh + ((ulong)c1 * nkv + c) * Q_ATT_D);
+    float8 s0 = (float8)0.0f, s1 = (float8)0.0f;
+    __attribute__((opencl_unroll_hint)) for (uint k = 0; k < Q_ATT_D / 16; k++) {
+      s0 = dpas8_f16(qa[k], as_int8(vload8(0, kr0 + 8 * k)), s0);
+      s1 = dpas8_f16(qa[k], as_int8(vload8(0, kr1 + 8 * k)), s1);
+    }
+    if (!val0) s0 = (float8)(-INFINITY);
+    if (!val1) s1 = (float8)(-INFINITY);
+    const float8 bm = fmax(s0, s1);
+    if (sub_group_any(any(bm > mrow + ATT_MAX_SLACK))) {
+      float b8[8];
+      vstore8(bm, 0, b8);
+      for (uint m = 0; m < 8; m++) b8[m] = sub_group_reduce_max(b8[m]);
+      const float8 mn = fmax(mrow, vload8(0, b8)), al = exp(mrow - mn);
+      for (uint j = 0; j < 16; j++) o[j] *= al;
+      lrow *= al;
+      mrow = mn;
+    }
+    const float8 e0 = exp(s0 - mrow), e1 = exp(s1 - mrow);
+    lrow += e0 + e1;
+    const short8 P0 = as_short8(convert_half8(e0)), P1 = as_short8(convert_half8(e1));
+    // The A operand's cell pairs: lane l holds cells 2l and 2l + 1, the first from the lower half for l < 4.
+    int8 Pc;
+    const uint src = lane < 4 ? 2 * lane : 2 * lane - 8;
+    __attribute__((opencl_unroll_hint)) for (uint m = 0; m < 8; m++) {
+      const int lo0 = intel_sub_group_shuffle((int)as_ushort(P0[m]), src);
+      const int lo1 = intel_sub_group_shuffle((int)as_ushort(P1[m]), src);
+      const int hi0 = intel_sub_group_shuffle((int)as_ushort(P0[m]), src + 1);
+      const int hi1 = intel_sub_group_shuffle((int)as_ushort(P1[m]), src + 1);
+      const int lo = lane < 4 ? lo0 : lo1, hi = lane < 4 ? hi0 : hi1;
+      Pc[m] = (lo & 0xffff) | (hi << 16);
+    }
+    for (uint j = 0; j < 16; j++) {
+      const uint d = 8 * (part * 16 + j) + lane;
+      int8 B;
+      __attribute__((opencl_unroll_hint)) for (uint p = 0; p < 8; p++) {
+        const uint ce = cells[min(i0 + 2 * p, n - 1)], co = cells[min(i0 + 2 * p + 1, n - 1)];
+        const ushort a = as_ushort(vh[((ulong)ce * nkv + c) * Q_ATT_D + d]);
+        const ushort b = as_ushort(vh[((ulong)co * nkv + c) * Q_ATT_D + d]);
+        B[p] = (int)((uint)a | ((uint)b << 16));
+      }
+      o[j] = dpas8_f16(Pc, B, o[j]);
+    }
+  }
+  for (uint x = 1; x < 8; x *= 2) lrow += intel_sub_group_shuffle_xor(lrow, x);
+  float lr[8];
+  vstore8(lrow, 0, lr);
+  for (uint j = 0; j < 16; j++) {
+    float ov[8];
+    vstore8(o[j], 0, ov);
+    const uint d = 8 * (part * 16 + j) + lane;
+    for (uint m = 0; m < 8; m++) {
+      if (hk0 + m >= Q_ATT_H / Q_ATT_KV) break;
+      const uint h = c * (Q_ATT_H / Q_ATT_KV) + hk0 + m;
+      const float gate = Q[((ulong)t * nq + h) * 2 * Q_ATT_D + Q_ATT_D + d];
+      o16[((ulong)t * nq + h) * Q_ATT_D + d] = convert_half(ov[m] / lr[m] * sigmoid(gate));
+    }
+  }
+}
+#else
 REQD_SG __kernel void p_attn_xmx(__global const half *qt, __global const float *Q, __global const half *kh,
                                  __global const half *vh, uint nq, uint hp, uint nkv, __global const uint *cells_all,
                                  __global const uint *ncells, __global const PromptPlan *pp, __global half *o16) {
@@ -147,6 +247,7 @@ REQD_SG __kernel void p_attn_xmx(__global const half *qt, __global const float *
     }
   }
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------
 // A short run's rows (at most PROMPT_SHORT_RUN: a decode row and its drafts) attend as the decode step's attn_split
@@ -283,10 +384,21 @@ __kernel void p_attn_rows_merge(__global const float *Q, uint nq, __global const
 #if Q_IDX_H != 4 || Q_IDX_D % 16
 #error "p_idx_score_xmx tiles 2 rows by the indexer's 4 heads, and 16 dimensions a step"
 #endif
+#ifdef ENGINE_DG2
+// The Alchemist form: sub-group 8, two K values a lane (the queries split by dimension), 8 blocks a tile.
+#include "dg2.h"
+#define IDX_SG REQD_SG8
+#define IDX_LANES SG8
+#define IDX_DPAS dpas8_f16
+#else
+#define IDX_SG REQD_SG
+#define IDX_LANES 16
+#define IDX_DPAS dpas_f16
+#endif
 static inline uint idx_own_x(uint nb, uint c, uint C) { return nb > c ? (nb - c + C - 1) / C : 0; }
-REQD_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const ushort *ql, __global const half *kh,
-                                      __global const half *kl, __global const uint *pt, uint npp, uint nb_max,
-                                      __global const PromptPlan *runs, __global float *scores, uint c, uint C) {
+IDX_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const ushort *ql, __global const half *kh,
+                                     __global const half *kl, __global const uint *pt, uint npp, uint nb_max,
+                                     __global const PromptPlan *runs, __global float *scores, uint c, uint C) {
   __global const PromptPlan *pp = runs + get_group_id(2);
   const uint lane = sg_lane(), n = pp->n, t0 = IDX_XMX_ROWS * get_group_id(1);
   if (t0 >= n) return;
@@ -295,11 +407,11 @@ REQD_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const 
   const uint nkv_last = pp->pos0 + t0 + rows;
   if (nkv_last <= Q_IDX_CELLS) return;
   const uint nown = idx_own_x(nkv_last / Q_IDX_BLOCK, c, C);
-  const uint b0 = (get_group_id(0) * get_num_sub_groups() + get_sub_group_id()) * 16 * IDX_XMX_TB;
+  const uint b0 = (get_group_id(0) * get_num_sub_groups() + get_sub_group_id()) * IDX_LANES * IDX_XMX_TB;
   if (b0 >= nown) return;
   ulong K[IDX_XMX_TB];
   for (uint j = 0; j < IDX_XMX_TB; j++) {
-    const uint lb = min(b0 + 16 * j + lane, nown - 1);
+    const uint lb = min(b0 + IDX_LANES * j + lane, nown - 1);
     K[j] = (ulong)(kv_page(pt, npp, pp->slot, (lb * C + c) * Q_IDX_BLOCK) / C) * Q_IDX_D;
   }
   float8 acc[IDX_XMX_ROWS / 2][IDX_XMX_TB];
@@ -312,6 +424,30 @@ REQD_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const 
       bl[j] = as_int8(vload8(0, (__global const uint *)(kl + K[j]) + 8 * s));
     }
     for (uint i = 0; i < IDX_XMX_ROWS / 2; i++) {
+#ifdef ENGINE_DG2
+      // The tile's rows 2i and 2i + 1 (the last row again past the run's end), 4 heads each, at dimensions
+      // 16 s + 2 lane and 16 s + 2 lane + 1: a[m] pairs the two dimensions of row m / 4's head m % 4.
+      const ulong r0 = ((ulong)(pp->row0 + t0 + min(2 * i, rows - 1)) * Q_IDX_D + 16 * s + 2 * lane) * Q_IDX_H;
+      const ulong r1 = ((ulong)(pp->row0 + t0 + min(2 * i + 1, rows - 1)) * Q_IDX_D + 16 * s + 2 * lane) * Q_IDX_H;
+      const uint st = Q_IDX_H;
+      const ushort4 h00 = vload4(0, qh + r0), h01 = vload4(0, qh + r0 + st);
+      const ushort4 h10 = vload4(0, qh + r1), h11 = vload4(0, qh + r1 + st);
+      const ushort4 l00 = vload4(0, ql + r0), l01 = vload4(0, ql + r0 + st);
+      const ushort4 l10 = vload4(0, ql + r1), l11 = vload4(0, ql + r1 + st);
+      const int8 a = (int8)((uint)h00.s0 | ((uint)h01.s0 << 16), (uint)h00.s1 | ((uint)h01.s1 << 16),
+                            (uint)h00.s2 | ((uint)h01.s2 << 16), (uint)h00.s3 | ((uint)h01.s3 << 16),
+                            (uint)h10.s0 | ((uint)h11.s0 << 16), (uint)h10.s1 | ((uint)h11.s1 << 16),
+                            (uint)h10.s2 | ((uint)h11.s2 << 16), (uint)h10.s3 | ((uint)h11.s3 << 16));
+      const int8 b = (int8)((uint)l00.s0 | ((uint)l01.s0 << 16), (uint)l00.s1 | ((uint)l01.s1 << 16),
+                            (uint)l00.s2 | ((uint)l01.s2 << 16), (uint)l00.s3 | ((uint)l01.s3 << 16),
+                            (uint)l10.s0 | ((uint)l11.s0 << 16), (uint)l10.s1 | ((uint)l11.s1 << 16),
+                            (uint)l10.s2 | ((uint)l11.s2 << 16), (uint)l10.s3 | ((uint)l11.s3 << 16));
+      for (uint j = 0; j < IDX_XMX_TB; j++) {
+        acc[i][j] = IDX_DPAS(a, bh[j], acc[i][j]);
+        acc[i][j] = IDX_DPAS(a, bl[j], acc[i][j]);
+        acc[i][j] = IDX_DPAS(b, bh[j], acc[i][j]);
+      }
+#else
       // The tile's rows 2i and 2i + 1 (the last row again past the run's end), 4 heads each, at dimension 16 s + lane.
       const ulong r0 = ((ulong)(pp->row0 + t0 + min(2 * i, rows - 1)) * Q_IDX_D + 16 * s + lane) * Q_IDX_H;
       const ulong r1 = ((ulong)(pp->row0 + t0 + min(2 * i + 1, rows - 1)) * Q_IDX_D + 16 * s + lane) * Q_IDX_H;
@@ -322,6 +458,7 @@ REQD_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const 
         acc[i][j] = dpas_f16(a, bl[j], acc[i][j]);
         acc[i][j] = dpas_f16(b, bh[j], acc[i][j]);
       }
+#endif
     }
   }
   uint lim[IDX_XMX_ROWS];  // row r's blocks on this card, those complete at its position (none below the width)
@@ -331,7 +468,7 @@ REQD_SG __kernel void p_idx_score_xmx(__global const ushort *qh, __global const 
   }
   for (uint i = 0; i < IDX_XMX_ROWS / 2; i++)
     for (uint j = 0; j < IDX_XMX_TB; j++) {
-      const uint lb = b0 + 16 * j + lane;
+      const uint lb = b0 + IDX_LANES * j + lane;
       const float8 a = acc[i][j];
       for (uint u = 0; u < 2; u++) {
         const uint r = 2 * i + u, t = t0 + r;

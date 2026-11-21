@@ -122,16 +122,40 @@ __kernel void hc_mix(__global const float *n, __global const float *a, __global 
 // to_bf16_rows), 16 of W's value-major rows a sub-group (4 values' a for the 4 streams), then hc_mix's sum in stream
 // order. A work-group's 8 sub-groups write 32 values of x, also as bf16 into xb (rows Q_EMBD apart) and as a8 into xa
 // (a8.h; rows Q_EMBD + Q_EMBD / 8 bytes apart, sub-group m storing rows m, m + 8, ...). Groups (Q_HC_DIM / 128), 128.
+#ifdef ENGINE_DG2
+// The Alchemist form: sub-group 8, so a work-group's 128 work-items are 16 sub-groups of 8 columns: the same 128
+// columns, with a group of four lanes holding the four streams of one value.
+#include "dg2.h"
+#define UPM_SGS 16
+#define UPM_KERNEL_SG REQD_SG8
+#define UPM_LANES SG8
+#else
 #define UPM_SGS 8
-REQD_SG __kernel void hc_up_mix_xmx(__global const ushort *W, __global const ushort *lrb, __global const float *n,
-                                    __global const StepPlan *plan, __global float *x, __global uchar *xa,
-                                    __global ushort *xb) {
+#define UPM_KERNEL_SG REQD_SG
+#define UPM_LANES SG_SIZE
+#endif
+UPM_KERNEL_SG __kernel void hc_up_mix_xmx(__global const ushort *W, __global const ushort *lrb,
+                                          __global const float *n, __global const StepPlan *plan, __global float *x,
+                                          __global uchar *xa, __global ushort *xb) {
   __local float xs[STEP_ROWS][32];
+#ifdef ENGINE_DG2
+  const uint lane = sg_lane(), n0 = (get_group_id(0) * UPM_SGS + sg_id()) * 8, ntok = plan->nrows;
+#else
   const uint lane = sg_lane(), n0 = (get_group_id(0) * UPM_SGS + sg_id()) * 16, ntok = plan->nrows;
+#endif
   const uint tiles = (ntok + 7) / 8;
   float8 acc[STEP_ROWS / 8];
   __attribute__((opencl_unroll_hint)) for (uint t = 0; t < STEP_ROWS / 8; t++) acc[t] = (float8)0.0f;
   for (uint k = 0; k < Q_HC_LR; k += 16) {
+#ifdef ENGINE_DG2
+    const int8 b = sg_load_b8(W, n0, Q_HC_LR, k, Q_HC_DIM, lane);
+    __attribute__((opencl_unroll_hint)) for (uint t = 0; t < STEP_ROWS / 8; t++) {
+      if (t < tiles) {
+        const int8 a = sg_load_a8(lrb, 8 * t, Q_HC_LR, k, ntok, lane);
+        acc[t] = dpas8_bf16(a, b, acc[t]);
+      }
+    }
+#else
     uint b[8];
     sg_load_cols16(W, Q_HC_LR * 2, Q_HC_DIM, Q_HC_LR * 2, k / 2, n0, b);
     __attribute__((opencl_unroll_hint)) for (uint t = 0; t < STEP_ROWS / 8; t++) {
@@ -142,6 +166,7 @@ REQD_SG __kernel void hc_up_mix_xmx(__global const ushort *W, __global const ush
         acc[t] = dpas_bf16(as_short8(vload8(0, a)), as_int8(vload8(0, b)), acc[t]);
       }
     }
+#endif
   }
   // Lane l holds a_s[i] for s = l % 4, i = n0 / 4 + l / 4.
   const uint s = lane % Q_HC, i = n0 / Q_HC + lane / Q_HC;
@@ -163,8 +188,13 @@ REQD_SG __kernel void hc_up_mix_xmx(__global const ushort *W, __global const ush
     }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+#ifdef ENGINE_DG2
+  for (uint m = sg_id(); m < ntok; m += UPM_SGS)
+    a8_store8(vload4(lane, xs[m]), xa + (ulong)m * (Q_EMBD + Q_EMBD / 8), Q_EMBD, get_group_id(0));
+#else
   for (uint m = sg_id(); m < ntok; m += UPM_SGS)
     a8_store(vload2(lane, xs[m]), xa + (ulong)m * (Q_EMBD + Q_EMBD / 8), Q_EMBD, get_group_id(0));
+#endif
 }
 
 // After an exchange (1.2): y = the cards' partial sums added in card order, R_s += 2 sigma(inject_s / 4) y. P holds
