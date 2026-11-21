@@ -45,7 +45,19 @@ struct Card {
   uint32_t xe_cores = 0;          // slices x subslices per slice
   int32_t pcie_gen = -1, pcie_width = -1;  // the link's most, as the driver reports it; -1: unknown
   int64_t pcie_bytes_per_s = -1;
+  // The dma-buf CPU mapping is write-back, not write-combining (Alchemist): a writer must push its lines out
+  // (flush_cpu_writes) before the fence, or the card may read what was there before. ENGINE_STAGE_FLUSH overrides.
+  bool writeback_mapping = false;
+  // A kernel on one card may read and write the other's device memory (ADR-0030's exchanges). Alchemist drops such
+  // stores silently; the engine then keeps those exchange buffers in host memory, which both cards reach.
+  bool peer_kernel_access = true;
+  // A kernel polling a host flag sees the CPU's later stores (Battlemage). Alchemist does not: there the host
+  // synchronizes each layer's part instead. ENGINE_CPU_DOORBELL=poll forces polling.
+  bool host_flag_polling = true;
 };
+
+// Pushes the CPU's dirty cache lines of [p, p + bytes) to where the card reads them: clflushopt when the CPU has it.
+void flush_cpu_writes(void *p, size_t bytes);
 
 class Runtime {
  public:
@@ -107,6 +119,20 @@ class Runtime {
 
 class Kernel;
 
+// A queue regular lists share: what is submitted on it runs in the order it was submitted.
+class Queue {
+ public:
+  explicit Queue(Runtime &rt, uint32_t card, bool copy_engine = false);
+  ~Queue();
+  Queue(const Queue &) = delete;
+  Queue &operator=(const Queue &) = delete;
+
+  ze_command_queue_handle_t handle() const { return queue_; }
+
+ private:
+  ze_command_queue_handle_t queue_ = nullptr;
+};
+
 // A module built ahead of time by ocloc, loaded on one card: its native binary, or with spirv_options its SPIR-V,
 // which the driver compiles with those build options.
 class Module {
@@ -155,7 +181,8 @@ class EventPool {
 class List {
  public:
   enum Kind { immediate, regular };
-  List(Runtime &rt, uint32_t card, Kind kind, bool copy_engine = false, bool in_order = true);
+  // share: a queue this list's parts are submitted on, in order with the lists sharing it.
+  List(Runtime &rt, uint32_t card, Kind kind, bool copy_engine = false, bool in_order = true, Queue *share = nullptr);
   ~List();
   List(const List &) = delete;
   List &operator=(const List &) = delete;
@@ -183,6 +210,11 @@ class List {
   void label(std::string name) { label_ = std::move(name); }  // names the next launch in the trace instead
   const std::vector<std::string> &trace_names() const { return trace_names_; }
 
+  // Ends the recorded part and starts another, to be submitted on its own, after the host has synchronized this one.
+  void split();
+  uint32_t parts() const { return (uint32_t)lists_.size(); }
+  void execute_part(uint32_t i);      // regular, split lists: submit part i (does not wait)
+  void synchronize_part(uint32_t i);  // waits for part i, and so for every part submitted before it
   void close();         // regular lists: end recording
   void execute();       // regular lists: submit on the card's queue (does not wait)
   void synchronize();   // waits for everything submitted so far
@@ -202,13 +234,19 @@ class List {
   };
   std::atomic<std::thread::id> user_{};
 
+  void add_part();
   Runtime &rt_;
   uint32_t card_;
   Kind kind_;
+  uint32_t ordinal_ = 0;
   bool in_order_, together_ = false;
-  ze_command_list_handle_t list_ = nullptr;
+  // The recorded parts in submission order: one unless split(), and a fence each for parts submitted on their own.
+  std::vector<ze_command_list_handle_t> lists_;
+  std::vector<ze_fence_handle_t> fences_;
+  std::vector<bool> part_submitted_;
   ze_command_queue_handle_t queue_ = nullptr;
-  ze_fence_handle_t fence_ = nullptr;
+  bool own_queue_ = false;
+  ze_command_list_handle_t list_ = nullptr;  // the part being recorded
   bool submitted_ = false;
   uint64_t *trace_ = nullptr;
   size_t trace_cap_ = 0;
