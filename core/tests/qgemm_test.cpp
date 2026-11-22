@@ -82,6 +82,42 @@ int main() {
     rt.free(dO);
   };
 
+  // dequant_f16_p (the big tile's packed B) against dequant_f16 followed by pack_b: the same words.
+  auto dequant_packed = [&](uint32_t type, const std::string &name, const uint8_t *blocks, uint32_t rows, uint32_t K) {
+    const uint32_t bpr = K / quant_block_values(type), units = K / 32, ks = K / 16, nb = (rows + 7) / 8;
+    std::vector<uint8_t> runs(runs_bytes(type, (uint64_t)rows * bpr));
+    to_runs(type, {{blocks, (uint64_t)bpr * quant_block_bytes(type), 0, rows, 0, bpr}}, runs.data());
+    const std::string mod = "qgemm_" + lower(ggml_type_label(type));
+    auto *dW = static_cast<uint8_t *>(rt.alloc_device(card, runs.size()));
+    auto *dOrd = static_cast<uint16_t *>(rt.alloc_device(card, (size_t)rows * K * 2));
+    auto *dPk = static_cast<uint32_t *>(rt.alloc_device(card, (size_t)nb * ks * 64 * 4));
+    auto *dRef = static_cast<uint32_t *>(rt.alloc_device(card, (size_t)nb * ks * 64 * 4));
+    L.copy(dW, runs.data(), runs.size());
+    uint32_t zero = 0;
+    L.launch(lib.get(card, mod, "dequant_f16"), {dW, rows, bpr, zero, units, dOrd, K, grids}, (rows * units + 63) / 64,
+             1, 1, 64);
+    L.launch(lib.get(card, "pack", "pack_b"), {dOrd, rows, K, ks, dRef}, nb * ks * 8, 1, 1, 8);
+    L.launch(lib.get(card, mod, "dequant_f16_p"), {dW, rows, bpr, zero, units, dPk, ks, grids}, nb * units * 8, 1, 1,
+             8);
+    L.synchronize();
+    const size_t bytes = (size_t)nb * ks * 64 * 4;
+    auto *h1 = static_cast<uint32_t *>(rt.alloc_host(bytes));
+    auto *h2 = static_cast<uint32_t *>(rt.alloc_host(bytes));
+    L.copy(h1, dRef, bytes);
+    L.copy(h2, dPk, bytes);
+    L.synchronize();
+    const bool same = std::memcmp(h1, h2, bytes) == 0;
+    ck.failures += !same;
+    std::printf("%-58s %s\n", (std::string("dequant_f16_p ") + ggml_type_label(type) + " " + name).c_str(),
+                same ? "same words" : "FAIL");
+    rt.free(h1);
+    rt.free(h2);
+    rt.free(dW);
+    rt.free(dOrd);
+    rt.free(dPk);
+    rt.free(dRef);
+  };
+
   // The expert products: card 1's half of an expert of F rows (gate and up) or F values a row (down), so the slices
   // start mid-row; 75 assignments in two tiles (64 + 11).
   const uint32_t E = 2560, nasg = 75;
@@ -217,6 +253,7 @@ int main() {
     const uint32_t qk = quant_block_values(type), F = 1024;
     std::vector<uint8_t> dense = test::random_blocks(type, 200 * E / qk, rng);
     dequant(type, "random blocks", dense.data(), 200, E);
+    dequant_packed(type, "random blocks", dense.data(), 200, E);
     std::vector<uint8_t> g = test::random_blocks(type, F * E / qk, rng), u = test::random_blocks(type, F * E / qk, rng);
     std::vector<uint8_t> d = test::random_blocks(type, E * F / qk, rng);
     for (bool file : {false, true}) {
