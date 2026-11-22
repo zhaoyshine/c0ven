@@ -79,6 +79,11 @@ void Model::load_prompt(Card &card) {
   };
   auto xf32 = [&](uint64_t n) { return reinterpret_cast<float *>(xdev(n * 4)); };
   auto xu16 = [&](uint64_t n) { return reinterpret_cast<uint16_t *>(xdev(n * 2)); };
+  auto xu32 = [&](uint64_t n) { return reinterpret_cast<uint32_t *>(xdev(n * 4)); };
+  // Battlemage's kernels store the other card's part into its device memory themselves. Alchemist's cannot, and a
+  // copy straight into that memory resets this machine (the Zen 3 data fabric's sync flood): there the part goes
+  // through a host staging buffer, each card's own copy engine moving it out of, then into, its own memory.
+  const bool peer_stores = rt_->cards()[card.c].peer_kernel_access;
   P.R = xf32(T * shape_.hc_dim());
   P.inj[0] = f32(T * shape_.hc);
   P.inj[1] = f32(T * shape_.hc);
@@ -133,6 +138,7 @@ void Model::load_prompt(Card &card) {
   P.ncells = u32(T);
   P.cand = u32(T * shape_.idx_cand());
   P.cand_peer = u32(T * shape_.idx_cand());
+  P.cand_stage = peer_stores ? nullptr : xu32(T * shape_.idx_cand());
   P.merged = f32(T * 2 * (shape_.idx_blocks() + 1));
   P.kh = u16((uint64_t)opt_.max_ctx * card.nkv * shape_.att_key);
   P.vh = u16((uint64_t)opt_.max_ctx * card.nkv * shape_.att_key);
@@ -162,16 +168,60 @@ void Model::load_prompt(Card &card) {
   P.shh = u16(T * card.ff);
   P.s = f32(T * shape_.embd);
   P.part = u16(T * shape_.embd);
-  P.recv[0] = xu16(T * shape_.embd);
-  P.recv[1] = xu16(T * shape_.embd);
+  P.recv[0] = u16(T * shape_.embd);
+  P.recv[1] = u16(T * shape_.embd);
+  P.part_stage[0] = peer_stores ? nullptr : xu16(T * shape_.embd);
+  P.part_stage[1] = peer_stores ? nullptr : xu16(T * shape_.embd);
   P.ub = u16(T * shape_.embd);
   P.pv = f32(T * shape_.embd);
   P.gates = f32(T * shape_.hc);
-  uint64_t w16 = 0;
+  uint64_t w16 = 0, pk_w = 0, pk_x = 0;
+  // The big tile reads whole 128-row tiles of the packed operands: a matrix's rows are rounded up to that tile, so a
+  // shape whose N or rows are not a multiple of 128 still reads within its allocation (kernels/gemm_big.cl's stage).
+  auto packed_rows = [](uint64_t rows) { return (rows + 127) / 128 * 16; };
   for (auto &L : card.layers)
-    for (const Mat *m : {&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.sh_gate, &L.sh_up, &L.sh_down})
+    for (const Mat *m : {&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.sh_gate, &L.sh_up, &L.sh_down}) {
       w16 = std::max<uint64_t>(w16, (uint64_t)m->rows * m->K);
+      const uint64_t ks = (m->K + 15) / 16;
+      pk_w = std::max<uint64_t>(pk_w, packed_rows(m->rows) * ks * 64);
+      pk_x = std::max<uint64_t>(pk_x, packed_rows(T) * ks * 64);  // the activation tile's words
+    }
+  // The hyper-connections' and the PLE module's products (gemm's other calls): their rows by K.
+  for (const uint64_t ks : {(uint64_t)(shape_.hc_dim() + 15) / 16, (uint64_t)(shape_.hc_lr + 15) / 16,
+                            (uint64_t)(shape_.embd + 15) / 16}) {
+    const uint64_t rows = ks * 16 == shape_.hc_dim() ? shape_.hc_lr + shape_.hc : shape_.hc_dim();
+    pk_w = std::max<uint64_t>(pk_w, packed_rows(rows) * ks * 64);
+    pk_x = std::max<uint64_t>(pk_x, packed_rows(T) * ks * 64);
+  }
   P.w16 = u16(w16);
+  P.w16_bytes = w16 * 2;
+  if (rt_->cards()[card.c].ip_version >> 22 == 12 && ((rt_->cards()[card.c].ip_version >> 14) & 0xff) == 55) {
+    // Strata's guarded allocation: Alchemist's xe can hand a large buffer two virtual pages of one physical page.
+    auto checked = [&](uint64_t bytes) -> uint8_t * {
+      const uint32_t pat = 0xA5C3A5C3u;
+      for (int t = 0; t < 4; t++) {
+        uint8_t *p = dev(bytes);
+        card.up->fill(p, &pat, 4, bytes);
+        card.up->synchronize();
+        std::vector<uint32_t> back(bytes / 4);
+        card.up->copy(back.data(), p, bytes);
+        card.up->synchronize();
+        bool ok = true;
+        for (size_t i = 0; i < back.size() && ok; i++) ok = back[i] == pat;
+        if (ok) return p;
+        std::fprintf(stderr, "engine: card %u: a %.1f MiB buffer read back wrong; allocating again\n", card.c,
+                     bytes / 1048576.0);
+        rt_->free(p);
+      }
+      return dev(bytes);
+    };
+    P.wp = reinterpret_cast<uint32_t *>(checked(pk_w * 4 + (64u << 10)));
+    P.wcap = pk_w;
+    // The chunk's packed activations, apart from the plain path's dequantised weights: K of a hyper-connection's
+    // product can be hc_dim, whose packed tokens outgrow any dense weight's buffer.
+    P.xp = reinterpret_cast<uint32_t *>(checked(pk_x * 4 + (64u << 10)));
+    P.xcap = pk_x;
+  }
   if ((opt_.profile_routing || opt_.adapt_swaps) && card.c == 0) {
     const uint32_t z = 0;
     P.prof = u32(shape_.layers * shape_.experts);
@@ -429,7 +479,9 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
   PromptCard &P = *card.pc;
   const uint32_t key = runs << 16 | T;
   auto it = P.lists.find(key);
-  if (it != P.lists.end()) return *it->second;
+  if (it != P.lists.end()) {
+    return *it->second;
+  }
   auto list = std::make_unique<ze::List>(*rt_, card.c, ze::List::regular);
   ze::List &L = *list;
   if (opt_.trace) {
@@ -464,6 +516,27 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
     if (tm != 8 || tn != 2) mod += "_t" + std::to_string(tm) + "n" + std::to_string(tn);
     if (sg != 4) mod += "s" + std::to_string(sg);
     if (opt_.trace) L.label(std::string(bf16 ? "gemm_bf16 " : "gemm_f16 ") + std::to_string(N) + "x" + std::to_string(K));
+    // Alchemist: the operands to the DPAS layout and the 128 x 128 tile (kernels/gemm_big.cl), the same sums as
+    // gemm's. Where the packed copy does not fit the chunk's buffers, the plain loop stays.
+    // N and rows need not be multiples of the tile: the epilogue masks what lies outside them and the packed
+    // operands are read in whole 128-row tiles (32 % faster at 2,048 tokens than the aligned shapes alone).
+    const uint32_t ks = K / 16, nbw = (N + 7) / 8, nbx = (rows + 7) / 8;
+    const uint64_t ww = (uint64_t)((N + 127) / 128) * 16 * ks * 64;
+    const uint64_t xw = (uint64_t)((rows + 127) / 128) * 16 * ks * 64;
+    const bool big = big_ok_ && P.wp && P.xp && ww <= P.wcap && xw <= P.xcap && K % 32 == 0 && rows > 0 &&
+                     (rt_->cards()[c].ip_version >> 22) == 12 && ((rt_->cards()[c].ip_version >> 14) & 0xff) == 55;
+    if (big) {
+      const std::string tag = " " + std::to_string(N) + "x" + std::to_string(K) + " T" + std::to_string(rows);
+      if (opt_.trace) L.label(std::string("pack_b") + tag);
+      L.launch(kernel(c, "pack", "pack_b"), {W, N, K, ks, P.wp}, nbw * ks * 8, 1, 1, 8, 1, 1);
+      if (opt_.trace) L.label(std::string("pack_a") + tag);
+      L.launch(kernel(c, "pack", "pack_a"), {x, rows, K, ldx, ks, P.xp}, nbx * ks * 8, 1, 1, 8, 1, 1);
+      const uint32_t nblk = (N + 127) / 128, mblk = (rows + 127) / 128;
+      if (opt_.trace) L.label(std::string("gemm_big_p") + tag);
+      L.launch(kernel(c, bf16 ? "gemm_big_bf16" : "gemm_big", "gemm_big_p"),
+               {P.wp, P.xp, N, K, n, y, ldy, yh, mode, scale, nblk, y2, rows}, nblk * mblk, 1, 1, 32, 4, 1, sig);
+      return;
+    }
     const uint32_t band = (uint64_t)N * K * 2 > (18u << 20) ? 4 : 0;
     L.launch(kernel(c, mod, "gemm"), {W, N, K, K, x, ldx, n, y, ldy, yh, mode, scale, y2, band},
              (N + kSgSize * tn * sg - 1) / (kSgSize * tn * sg), (rows + 8 * tm - 1) / (8 * tm), 1, kSgSize * sg, 1,
@@ -474,6 +547,24 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
     std::string mod = std::string("qgemm_") + ggml_type_label(m.type);
     for (auto &ch : mod) ch = (char)std::tolower(ch);
     const uint32_t units = m.K / 32;
+    const uint32_t kstep = m.K / 16;
+    const uint64_t ww = (uint64_t)((m.rows + 127) / 128) * 16 * kstep * 64;
+    const uint64_t xw = (uint64_t)((T + 127) / 128) * 16 * kstep * 64;
+    const bool big = P.wp && P.xp && big_ok_ && T > 0 && ww <= P.wcap && xw <= P.xcap && m.K % 32 == 0;
+    if (big) {
+      const uint32_t nbx = (T + 7) / 8, nblk = (m.rows + 127) / 128, mblk = (T + 127) / 128;
+      const std::string tag = " " + std::to_string(m.rows) + "x" + std::to_string(m.K) + " T" + std::to_string(T);
+      if (opt_.trace) L.label(std::string("dequant_f16_p") + tag);
+      L.launch(kernel(c, mod, "dequant_f16_p"), {m.p, m.rows, m.bpr, zero, units, P.wp, kstep, card.grids},
+               ((m.rows + 7) / 8) * units * 8, 1, 1, 8, 1, 1);
+      if (opt_.trace) L.label(std::string("pack_a") + tag);
+      L.launch(kernel(c, "pack", "pack_a"), {x, T, m.K, ldx, kstep, P.xp}, nbx * kstep * 8, 1, 1, 8, 1, 1);
+      if (opt_.trace) L.label(std::string("gemm_big_p") + tag);
+      L.launch(kernel(c, "gemm_big", "gemm_big_p"),
+               {P.wp, P.xp, m.rows, m.K, &pplan_->n, y, ldy, yhalf ? 1u : 0u, 0u, 1.0f, nblk, y2, T},
+               nblk * mblk, 1, 1, 32, 4, 1, sig);
+      return;
+    }
     L.launch(kernel(c, mod, "dequant_f16"), {m.p, m.rows, m.bpr, zero, units, P.w16, m.K, card.grids},
              (m.rows * units + 63) / 64, 1, 1, 64);
     gemm(false, P.w16, m.rows, m.K, x, ldx, y, ldy, yhalf, 0, 1.0f, sig, 8, 2, y2);
@@ -492,12 +583,14 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
   const uint32_t half = split ? T / 2 : T;
   uint32_t r0 = 0, r1 = T;  // this card's rows, all of them until the split
   const uint32_t *nown = &pplan_->n;
+  const bool peer_stores = rt_->cards()[c].peer_kernel_access;
   // next_norm: the norm of the block that follows, done with the combine (p_hc_combine_norm), or null.
   auto exchange = [&](uint32_t l, uint32_t which, const float *inj, const float *next_norm) {
     const uint16_t *p0 = P.part, *p1 = nullptr;
     if (C > 1) {
       uint16_t *mine = P.recv[(2 * l + which) % 2];
       L.wait({(*pevents_)[pev(kEx, 2 * l + which, 1 - c)]});
+      if (!peer_stores) L.copy(mine, P.part_stage[(2 * l + which) % 2], (size_t)T * shape_.embd * 2);
       p0 = c == 0 ? P.part : mine;
       p1 = c == 0 ? mine : P.part;
     }
@@ -533,7 +626,6 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
              shape_.embd / 256, rows, 1, 64, 1, 1, send ? (*pevents_)[pev(kMix, block, c)] : nullptr);
     if (send) L.wait({(*pevents_)[pev(kMix, block, 1 - c)]});
   };
-
   L.launch(q4("p_hc_init"), {pembed_, pp, P.R}, shape_.hc_dim() / 64, T, 1, 64);
   for (uint32_t l = 0; l < shape_.layers; l++) {
     Layer &Ly = card.layers[l];
@@ -555,6 +647,12 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
     // Where this card's partial of exchange `which` also goes, and the event that says it is there.
     auto peer_part = [&](uint32_t which) { return C > 1 ? peer->recv[(2 * l + which) % 2] : nullptr; };
     auto sent = [&](uint32_t which) { return C > 1 ? (*pevents_)[pev(kEx, 2 * l + which, c)] : nullptr; };
+    // Alchemist cannot store into the other card's memory from a kernel (ze_smoke_test), so the copy engine leaves
+    // its partial in the other card's host stage; that card pulls it into its own recv.
+    auto send_part = [&](uint32_t which) {
+      if (C > 1 && !peer_stores)
+        L.copy(peer->part_stage[(2 * l + which) % 2], P.part, (size_t)T * shape_.embd * 2, sent(which));
+    };
     if (!Ly.attn) {
       const uint32_t nch = card.nch, nvo = card.nvh * shape_.gdn_d;
       dense(Ly.qkv, P.x16, shape_.embd, P.m, nch, false);
@@ -569,7 +667,12 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
       L.launch(kernel(c, "qwen4exp_gdn", "p_gdn_recur"),
                {P.u, nch, P.gb, Ly.S, Ly.S_stride, card.nkh, card.nvh, runs_p, P.raw}, card.nvh * 8, 1, runs, 64);
       L.launch(q4("p_gdn_out"), {P.raw, P.z, Ly.ssm_norm, card.nvh, pp, P.o16}, card.nvh, T, 1, shape_.gdn_d);
-      dense(Ly.out, P.o16, nvo, P.part, shape_.embd, true, peer_part(0), sent(0));
+      if (peer_stores) {
+        dense(Ly.out, P.o16, nvo, P.part, shape_.embd, true, peer_part(0), sent(0));
+      } else {
+        dense(Ly.out, P.o16, nvo, P.part, shape_.embd, true, nullptr, nullptr);
+        send_part(0);
+      }
     } else {
       const uint32_t nqo = card.nq * shape_.att_key;
       dense(Ly.q, P.x16, shape_.embd, P.Q, card.nq * 2 * shape_.att_key, false);
@@ -602,8 +705,10 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
       L.launch(q4("p_idx_cand"), {P.scores, nbl, runs_p, P.blocks, P.bscores, P.cand, c, C}, T, 1, 1, 1024);
       const uint32_t *c0 = P.cand, *c1 = nullptr;
       if (C > 1) {
-        L.copy(peer->cand_peer, P.cand, (size_t)T * shape_.idx_cand() * 4, (*pevents_)[pev(kIdx, Ly.idx, c)]);
+        L.copy(peer_stores ? peer->cand_peer : peer->cand_stage, P.cand, (size_t)T * shape_.idx_cand() * 4,
+               (*pevents_)[pev(kIdx, Ly.idx, c)]);
         L.wait({(*pevents_)[pev(kIdx, Ly.idx, 1 - c)]});
+        if (!peer_stores) L.copy(P.cand_peer, P.cand_stage, (size_t)T * shape_.idx_cand() * 4);
         c0 = c == 0 ? P.cand : P.cand_peer;
         c1 = c == 0 ? P.cand_peer : P.cand;
       }
@@ -626,7 +731,12 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
                  {P.qt, P.Q, P.kh, P.vh, card.nq, P.hp, card.nkv, P.cells, P.ncells, run(r), P.o16}, 1,
                  (T + xmx_rows - 1) / xmx_rows, 1, 16 * kAttXmxSubGroups);
       }
-      dense(Ly.o, P.o16, nqo, P.part, shape_.embd, true, peer_part(0), sent(0));
+      if (peer_stores) {
+        dense(Ly.o, P.o16, nqo, P.part, shape_.embd, true, peer_part(0), sent(0));
+      } else {
+        dense(Ly.o, P.o16, nqo, P.part, shape_.embd, true, nullptr, nullptr);
+        send_part(0);
+      }
     }
     exchange(l, 0, P.inj[0], Ly.hc_norm[1]);
 
@@ -678,8 +788,13 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
                                                        dbpr, b0, P.hg, ff, P.yg, card.grids}, E / 64, mt, 1, 64);
     }
     L.signal((*pevents_)[pev(kFree, l, c)]);
-    L.launch(q4("p_moe_combine"), {P.yg, P.inv, P.w, P.s, P.rl, pp, P.part, peer_part(1)},
-             shape_.embd / 128, T, 1, 64, 1, 1, sent(1));
+    if (peer_stores) {
+      L.launch(q4("p_moe_combine"), {P.yg, P.inv, P.w, P.s, P.rl, pp, P.part, peer_part(1)},
+               shape_.embd / 128, T, 1, 64, 1, 1, sent(1));
+    } else {
+      L.launch(q4("p_moe_combine"), {P.yg, P.inv, P.w, P.s, P.rl, pp, P.part, nullptr}, shape_.embd / 128, T, 1, 64);
+      send_part(1);
+    }
     exchange(l, 1, P.inj[1], l >= 1 && l + 1 < shape_.layers ? card.layers[l + 1].hc_norm[0] : nullptr);
     // DFlash 2 reads each run's last rows of the layer's output (dflash.cpp), from the card that holds them.
     for (uint32_t k = 0; df_on_ && k < DF_LAYERS; k++) {
@@ -706,12 +821,21 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
 std::vector<Candidate> Model::prompt(uint32_t slot, uint32_t pos0, const int32_t *tokens, uint32_t n, int32_t p1,
                                      int32_t p2, const int32_t *next, uint32_t next_n) {
   const PromptRun run{slot, pos0, tokens, n, p1, p2};
-  return std::move(prompt_runs(&run, 1, next, next_n)[0]);
+  auto out = std::move(prompt_runs(&run, 1, next, next_n)[0]);
+  return out;
 }
 
 std::vector<std::vector<Candidate>> Model::prompt_runs(const PromptRun *runs, uint32_t nruns, const int32_t *next,
                                                        uint32_t next_n) {
   if (tmax_ == 0) throw std::runtime_error("the prompt path is off");
+  {
+    uint32_t nn = 0;
+    for (uint32_t r = 0; r < nruns; r++) nn += runs[r].n;
+    std::fprintf(stderr, "engine: prompt chunk start: %u run(s), %u rows, %u cards\n", nruns, nn, ncards_);
+    for (uint32_t l = 0; l < shape_.layers; l++)
+      std::fprintf(stderr, "engine: layer %u: %s\n", l, cards_[0]->layers[l].attn ? "attention" : "gdn");
+    std::fflush(stderr);
+  }
   if (nruns == 0 || nruns > PROMPT_MAX_RUNS) throw std::runtime_error("a prompt chunk takes 1 to 4 runs");
   uint32_t n = 0;
   for (uint32_t r = 0; r < nruns; r++) {

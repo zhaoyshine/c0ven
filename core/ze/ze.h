@@ -46,13 +46,13 @@ struct Card {
   int32_t pcie_gen = -1, pcie_width = -1;  // the link's most, as the driver reports it; -1: unknown
   int64_t pcie_bytes_per_s = -1;
   // The dma-buf CPU mapping is write-back, not write-combining (Alchemist): a writer must push its lines out
-  // (flush_cpu_writes) before the fence, or the card may read what was there before. ENGINE_STAGE_FLUSH overrides.
+  // (flush_cpu_writes) before the fence, or the card may read what was there before.
   bool writeback_mapping = false;
   // A kernel on one card may read and write the other's device memory (ADR-0030's exchanges). Alchemist drops such
   // stores silently; the engine then keeps those exchange buffers in host memory, which both cards reach.
   bool peer_kernel_access = true;
   // A kernel polling a host flag sees the CPU's later stores (Battlemage). Alchemist does not: there the host
-  // synchronizes each layer's part instead. ENGINE_CPU_DOORBELL=poll forces polling.
+  // synchronizes each layer's part instead.
   bool host_flag_polling = true;
 };
 
@@ -235,6 +235,8 @@ class List {
   std::atomic<std::thread::id> user_{};
 
   void add_part();
+  // Tracing: names this command in trace_names() and writes its timestamp, as launch does for a kernel.
+  void trace_op(const char *name, uint64_t detail);
   Runtime &rt_;
   uint32_t card_;
   Kind kind_;

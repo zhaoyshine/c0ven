@@ -73,21 +73,13 @@ Runtime::Runtime(uint32_t min_cards) {
       c.max_alloc = p.maxMemAllocSize;
       c.device_id = p.deviceId;
       c.ip_version = ipv.ipVersion;
-      // Xe-HPG (Alchemist, IP 12.55) maps a dma-buf write-back; Battlemage maps it write-combining. ENGINE_STAGE_FLUSH
-      // forces either ("clflush"/"1", "none"/"0") when a driver reports the other IP.
+      // Xe-HPG (Alchemist, IP 12.55) maps a dma-buf write-back; Battlemage maps it write-combining.
       c.writeback_mapping = ((c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55);
-      if (const char *e = std::getenv("ENGINE_STAGE_FLUSH")) {
-        const std::string v(e);
-        if (v == "none" || v == "0") c.writeback_mapping = false;
-        else if (v == "clflush" || v == "1") c.writeback_mapping = true;
-      }
       // A kernel's store into the other card's memory is dropped on Alchemist (measured on two A770s); the engine keeps
-      // the prompt path's exchange buffers in host memory there. ENGINE_PEER_STORES forces the Battlemage behaviour.
+      // those exchange buffers in host memory there.
       c.peer_kernel_access = !((c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55);
-      if (const char *e = std::getenv("ENGINE_PEER_STORES")) c.peer_kernel_access = std::string(e) != "0";
       const bool hpg = (c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55;
       c.host_flag_polling = !hpg;
-      if (const char *e = std::getenv("ENGINE_CPU_DOORBELL")) c.host_flag_polling = std::string(e) == "poll";
       c.xe_cores = p.numSlices * p.numSubslicesPerSlice;
       c.timer_hz = p.timerResolution;  // cycles per second, with the 1.2 properties
       c.timestamp_mask = p.timestampValidBits >= 64 ? ~0ull : ((1ull << p.timestampValidBits) - 1);
@@ -550,6 +542,14 @@ void List::trace(uint64_t *ts, size_t cap) {
   timestamp(ts);
 }
 
+void List::trace_op(const char *name, uint64_t detail) {
+  if (!trace_ || trace_names_.size() + 1 >= trace_cap_) return;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%s %llu", name, (unsigned long long)detail);
+  trace_names_.push_back(buf);
+  timestamp(trace_ + trace_names_.size());
+}
+
 void List::copy(void *dst, const void *src, size_t bytes, ze_event_handle_t signal,
                 std::initializer_list<ze_event_handle_t> wait) {
   ONE_USER;
@@ -557,6 +557,7 @@ void List::copy(void *dst, const void *src, size_t bytes, ze_event_handle_t sign
   ZE_CHECK(zeCommandListAppendMemoryCopy(list_, dst, src, bytes, signal, (uint32_t)w.size(),
                                          w.empty() ? nullptr : w.data()));
   if (!in_order_) barrier();
+  trace_op("copy", bytes);
 }
 
 void List::copy_rows(void *dst, size_t dst_pitch, const void *src, size_t src_pitch, size_t width, size_t rows) {
@@ -565,31 +566,37 @@ void List::copy_rows(void *dst, size_t dst_pitch, const void *src, size_t src_pi
   ZE_CHECK(zeCommandListAppendMemoryCopyRegion(list_, dst, &region, (uint32_t)dst_pitch, 0, src, &region,
                                                (uint32_t)src_pitch, 0, nullptr, 0, nullptr));
   if (!in_order_) barrier();
+  trace_op("copy_rows", rows);
 }
 
 void List::fill(void *dst, const void *pattern, size_t pattern_size, size_t bytes) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendMemoryFill(list_, dst, pattern, pattern_size, bytes, nullptr, 0, nullptr));
   if (!in_order_) barrier();
+  trace_op("fill", bytes);
 }
 
 void List::wait(std::initializer_list<ze_event_handle_t> events) {
   ONE_USER;
   std::vector<ze_event_handle_t> w(events);
   ZE_CHECK(zeCommandListAppendWaitOnEvents(list_, (uint32_t)w.size(), w.data()));
+  trace_op("wait", w.size());
 }
 
 void List::signal(ze_event_handle_t e) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendSignalEvent(list_, e));
+  trace_op("signal", 0);
 }
 void List::reset(ze_event_handle_t e) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendEventReset(list_, e));
+  trace_op("reset", 0);
 }
 void List::barrier() {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendBarrier(list_, nullptr, 0, nullptr));
+  trace_op("barrier", 0);
 }
 
 void List::together(bool on) {

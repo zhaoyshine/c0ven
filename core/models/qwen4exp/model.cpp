@@ -275,6 +275,11 @@ void Model::load_cards(bool first) {
   if (df_on_)
     for (auto &card : cards_) load_dflash(*card);
   load_experts(first);
+  if (tmax_ && !cards_.empty() && cards_[0]->pc && cards_[0]->pc->wp) {
+    big_ok_ = big_self_check();
+    std::fprintf(stderr, "engine: big tile %s (check against gemm_f16)\n", big_ok_ ? "on" : "off");
+    std::fflush(stderr);
+  }
   ring_sync();
   std::fprintf(stderr, "engine: read %.2f GB of weights with O_DIRECT in %.2f s%s\n", reader_->bytes_read() / 1e9,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
@@ -922,7 +927,12 @@ void Model::load_card(Card &card) {
   card.ha8 = upload<uint8_t>(card, nullptr, W * shape_.used * a8_bytes(card.ff));
   card.sha8 = upload<uint8_t>(card, nullptr, W * a8_bytes(card.ff));
   card.yo = fbuf(shape_.embd);
-  if (ncards_ > 1) card.xp = upload<float>(card, nullptr, (size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4);
+  if (ncards_ > 1) {
+    card.xp = upload<float>(card, nullptr, (size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4);
+    // Alchemist cannot copy into the other card's memory: the block goes to host and the other card pulls it in.
+    if (!rt_->cards()[card.c].peer_kernel_access)
+      card.xp_stage = static_cast<float *>(rt_->alloc_host((size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4));
+  }
 }
 
 // Which experts the cards cache, and the arena of the others for the CPU. Each card holds half of every cached
@@ -1160,6 +1170,77 @@ std::unique_ptr<Model::HostLayer> Model::host_layer(uint32_t l, uint64_t n, cons
   return hl;
 }
 
+// The big tile against gemm_f16, bit for bit, on this driver: a driver that gets the shape or the packed layout wrong
+// is caught at load, and the plain path stays for the process.
+bool Model::big_self_check() {
+  struct Form {
+    uint32_t T, N, K;
+    bool bf;
+  };
+  bool ok = true;
+  const uint32_t c = 0, zero = 0;
+  // The shapes the prompt path's big calls take once the gates go by shape alone: the plain ones and the tails of N
+  // and rows that are not multiples of 128 (kernels/gemm_test.cpp has the larger shapes).
+  for (const Form f : {Form{32, 128, 256, false}, Form{40, 324, 64, false}, Form{37, 513, 320, true},
+                       Form{64, 320, 256, false}}) {
+    const uint32_t ks = f.K / 16, nbw = (f.N + 7) / 8, nbx = (f.T + 7) / 8;
+    const uint64_t wg = (uint64_t)((f.N + 127) / 128) * 16, xg = (uint64_t)((f.T + 127) / 128) * 16;
+    ze::List L(*rt_, c, ze::List::immediate);
+    std::vector<uint16_t> W((size_t)f.N * f.K), X((size_t)f.T * f.K);
+    const uint16_t base = f.bf ? 0x3f80 : 0x3c00;
+    for (size_t i = 0; i < W.size(); i++) W[i] = (uint16_t)(base + (i % 13));
+    for (size_t i = 0; i < X.size(); i++) X[i] = (uint16_t)(base + (i % 7));
+    auto *dW = static_cast<uint16_t *>(rt_->alloc_device(c, W.size() * 2));
+    auto *dX = static_cast<uint16_t *>(rt_->alloc_device(c, X.size() * 2));
+    auto *dT = static_cast<uint32_t *>(rt_->alloc_host(4));
+    const size_t n = (size_t)f.T * f.N;
+    auto *dRef = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dR2 = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dY = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dY2 = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dWp = static_cast<uint32_t *>(rt_->alloc_device(c, wg * ks * 64 * 4 + (64u << 10)));
+    auto *dXp = static_cast<uint32_t *>(rt_->alloc_device(c, xg * ks * 64 * 4 + (64u << 10)));
+    *dT = f.T;
+    L.copy(dW, W.data(), W.size() * 2);
+    L.copy(dX, X.data(), X.size() * 2);
+    L.launch(kernel(c, f.bf ? "gemm_bf16" : "gemm_f16", "gemm"),
+             {dW, f.N, f.K, f.K, dX, f.K, dT, (void *)dRef, f.N, 1u, zero, 1.0f, dR2, zero},
+             (f.N + 127) / 128, (f.T + 63) / 64, 1, 64);
+    L.launch(kernel(c, "pack", "pack_b"), {dW, f.N, f.K, ks, dWp}, nbw * ks * 8, 1, 1, 8, 1, 1);
+    L.launch(kernel(c, "pack", "pack_a"), {dX, f.T, f.K, f.K, ks, dXp}, nbx * ks * 8, 1, 1, 8, 1, 1);
+    L.launch(kernel(c, f.bf ? "gemm_big_bf16" : "gemm_big", "gemm_big_p"),
+             {dWp, dXp, f.N, f.K, dT, dY, f.N, 1u, zero, 1.0f, (f.N + 127) / 128, dY2, f.T},
+             ((f.N + 127) / 128) * ((f.T + 127) / 128), 1, 1, 32, 4, 1);
+    L.synchronize();
+    auto *h0 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    auto *h1 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    auto *h3 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    L.copy(h0, dRef, n * 2);
+    L.copy(h1, dY, n * 2);
+    L.copy(h3, dY2, n * 2);
+    L.synchronize();
+    size_t bad = 0, bad2 = 0;
+    for (size_t i = 0; i < n; i++) bad += h0[i] != h1[i], bad2 += h1[i] != h3[i];
+    if (bad || bad2)
+      std::fprintf(stderr, "engine: big tile self-check T %u N %u K %u %s: %zu differ, %zu in Y2\n", f.T, f.N, f.K,
+                   f.bf ? "bf16" : "f16", bad, bad2);
+    ok = ok && bad == 0 && bad2 == 0;
+    rt_->free(h0);
+    rt_->free(h1);
+    rt_->free(h3);
+    rt_->free(dW);
+    rt_->free(dX);
+    rt_->free(dT);
+    rt_->free(dRef);
+    rt_->free(dR2);
+    rt_->free(dY);
+    rt_->free(dY2);
+    rt_->free(dWp);
+    rt_->free(dXp);
+  }
+  return ok;
+}
+
 // y[t] = m x[t] for the *ntok tokens of a8 activations (read when the list runs, at most W), rows of m.rows apart.
 void Model::matvec(ze::List &list, Card &card, const Mat &m, const uint8_t *act, float *y, uint32_t W,
                    const uint32_t *ntok, ze_event_handle_t signal) {
@@ -1239,8 +1320,16 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
              shape_.hc_dim() / 128, 1, 1, 128);
   };
   // next_norm: the norm of the block that follows, done with the combine, or null.
+  const bool peer_stores = rt_->cards()[c].peer_kernel_access;
   auto exchange = [&](float *partials, uint32_t layer, uint32_t base, const float *inj, const float *next_norm) {
-    if (C > 1) L.wait({(*events_)[ev(layer, base + (1 - c))]});
+    if (C > 1) {
+      L.wait({(*events_)[ev(layer, base + (1 - c))]});
+      if (!peer_stores) {
+        const uint32_t k = base == 0 ? 0 : 1;
+        L.copy(card.xp + ((size_t)k * C + (1 - c)) * STEP_MAX_ROWS * shape_.embd,
+               card.xp_stage + ((size_t)k * C + (1 - c)) * STEP_MAX_ROWS * shape_.embd, (size_t)W * shape_.embd * 4);
+      }
+    }
     const uint32_t lw = shape_.hc_lr + shape_.hc;
     const uint32_t rows_apart = STEP_MAX_ROWS;  // each card's block in ex1_ and ex2_ holds STEP_MAX_ROWS rows
     if (next_norm)
@@ -1256,9 +1345,12 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
   // other's, and the combine reads both in card order, so the sums match. k: 0 the mixer's exchange, 1 the MoE's.
   const bool peer = C > 1 && W > 1;
   auto xp_block = [&](const Card &to, uint32_t k) { return to.xp + ((size_t)k * C + c) * STEP_MAX_ROWS * shape_.embd; };
+  auto xp_stage_block = [&](const Card &to, uint32_t k) {
+    return to.xp_stage + ((size_t)k * C + c) * STEP_MAX_ROWS * shape_.embd;
+  };
   auto send_peer = [&](uint32_t k, uint32_t layer, uint32_t base) {
-    L.copy(xp_block(*cards_[1 - c], k), xp_block(card, k), (size_t)W * shape_.embd * 4,
-           (*events_)[ev(layer, base + c)]);
+    float *dst = peer_stores ? xp_block(*cards_[1 - c], k) : xp_stage_block(*cards_[1 - c], k);
+    L.copy(dst, xp_block(card, k), (size_t)W * shape_.embd * 4, (*events_)[ev(layer, base + c)]);
   };
   auto out_product = [&](const Mat &m, float *p1, uint32_t layer) {
     if (W == 1) {

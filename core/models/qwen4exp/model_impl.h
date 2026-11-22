@@ -248,6 +248,8 @@ struct Model::Card {
   // A window's partial sums with two cards (ADR-0030): [exchange 0 mixer, 1 MoE][card][STEP_MAX_ROWS][embd]. Each
   // card writes its own block here and one copy places it in the other card's.
   float *xp = nullptr;
+  // Alchemist: the other card's copy leaves its block here, and this card's copy pulls it into xp.
+  float *xp_stage = nullptr;
   StepPlan *plan = nullptr;  // the step plan, copied from host memory by the decode step's first command
   std::unique_ptr<ze::List> up;
   std::unique_ptr<ze::Queue> stepq;  // the decode step's parts, in submission order (Alchemist)
@@ -305,6 +307,9 @@ struct Model::PromptCard {
   float *rl = nullptr, *w = nullptr, *shg = nullptr, *shu = nullptr, *s = nullptr;
   uint16_t *part = nullptr;     // this card's fp16 partial sum, before one copy takes it to the other card
   uint16_t *recv[2] = {};       // the other card's, copied in by that card: exchange e into recv[e % 2]
+  // Alchemist: the other card's copy leaves its part in host memory here, and this card's copy pulls it into recv.
+  uint16_t *part_stage[2] = {};
+  uint32_t *cand_stage = nullptr;  // the same, for the indexer's candidates
   int32_t *ids = nullptr;
   uint32_t *cnt = nullptr, *base = nullptr, *cursor = nullptr, *inv = nullptr;
   uint32_t *ntiles_c = nullptr, *ntiles_s = nullptr;
@@ -314,6 +319,11 @@ struct Model::PromptCard {
   uint16_t *ub = nullptr;
   float *pv = nullptr, *gates = nullptr;
   uint16_t *w16 = nullptr;  // a dense weight dequantised to fp16
+  uint64_t w16_bytes = 0;
+  // Alchemist's big-tile products (kernels/gemm_big.cl): the dense weight and the activations in the DPAS layout,
+  // kernels/pack.cl. wp holds the largest dense matrix; xp the chunk's activations.
+  uint32_t *wp = nullptr, *xp = nullptr;
+  uint64_t wcap = 0, xcap = 0;  // their words
   uint32_t *prof = nullptr;  // [layer][expert] rows routed, with Options::profile_routing (card 0)
   // The experts the cards do not cache, streamed in on the copy engine: two layers' worth, used in turn.
   uint8_t *stage = nullptr;
