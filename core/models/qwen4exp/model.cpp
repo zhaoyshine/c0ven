@@ -1409,8 +1409,14 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
     } else {
       matvec(L, card, Ly.sh_down, card.sha8, card.s, W, nrows);
     }
-    // With layer_sync_ the CPU's answers are written before this part is submitted.
-    if (c == 0 && !layer_sync_) L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
+    // layer_sync_: the cached experts above run while the host computes this layer's misses; the host starts the part
+    // that needs its answers with an event. One event for each layer, signalled by the host once its answers are in.
+    if (layer_sync_) {
+      L.split();
+      if (c == 0) L.wait({(*events_)[ev(l, 2 * ncards_)]});
+    } else if (c == 0) {
+      L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
+    }
     float *p2 = ex2_ + l * ex_layer + (size_t)c * STEP_MAX_ROWS * shape_.embd;
     const float *cpu = c == 0 ? cpu_y_ + (size_t)l * STEP_MAX_ROWS * shape_.embd : nullptr;
     if (peer) {
@@ -1596,7 +1602,10 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
   for (uint32_t i = 0; i < events_->size(); i++) ZE_CHECK(zeEventHostReset((*events_)[i]));
   ze::List *card0_list = cards_[0]->lists.at(key).get();
   if (layer_sync_)
-    for (auto &card : cards_) card->lists.at(key)->execute_part(0);
+    // A layer is three parts: to the router, the cached experts, and what waits for the CPU's answers together with
+    // the next layer's front. The first layer's three are submitted at once.
+    for (auto &card : cards_)
+      for (uint32_t p = 0; p < 3; p++) card->lists.at(key)->execute_part(p);
   else
     for (uint32_t c = ncards_; c-- > 0;) cards_[c]->lists.at(key)->execute();
   // The n-gram rows, all read at once while the cards run layer 0 (ADR-0015); they wait for the event before layer 1.
@@ -1615,7 +1624,8 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
     // The layer's records: the part ending at this layer's router, or card 0's publish of each row's, for this
     // step; then all the rows' misses at once, each expert's weights read once.
     // layer_sync_: once the part's fence is down, the routing is in host memory.
-    if (layer_sync_) card0_list->synchronize_part(l);
+    // layer_sync_: part 2l ends at this layer's router, its 2l+1 is the cached experts, submitted already.
+    if (layer_sync_) card0_list->synchronize_part(2 * l);
     jobs.clear();
     HostLayer &hl = *host_layers_[l];
     for (uint32_t r = 0; r < n; r++) {
@@ -1641,12 +1651,16 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
       cpu_->compute_many(hl.shape, jobs, n, xs.data(), E, cpu_y_ + (size_t)l * STEP_MAX_ROWS * E, E);
       if (!layer_sync_) std::atomic_ref<uint32_t>(ans_seq_[16 * l]).store(step, std::memory_order_release);
     }
-    // layer_sync_: submitted after the CPU's answers, so no kernel waits on the host.
-    if (layer_sync_)
-      for (auto &card : cards_) card->lists.at(key)->execute_part(l + 1);
+    // layer_sync_: the answers are in; let the layer's tail run, while the cards start the next layer's parts.
+    if (layer_sync_) {
+      ZE_CHECK(zeEventHostSignal((*events_)[ev(l, 2 * ncards_)]));
+      if (l + 1 < shape_.layers)
+        for (auto &card : cards_)
+          for (uint32_t p = 2 * l + 3; p <= 2 * l + 4; p++) card->lists.at(key)->execute_part(p);
+    }
   }
   if (layer_sync_) {
-    for (auto &card : cards_) card->lists.at(key)->synchronize_part(shape_.layers);
+    for (auto &card : cards_) card->lists.at(key)->synchronize_part(2 * shape_.layers);
   } else {
     for (auto &card : cards_) card->lists.at(key)->synchronize();
     if (*stuck_) throw std::runtime_error("card 0 gave up waiting for the CPU's experts");
