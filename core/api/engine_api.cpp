@@ -1537,15 +1537,6 @@ engine_status open_engine(const engine_config *config, engine_info *info, engine
                                                  e->model->draft_max_cap()})
                                      : e->model->draft_max_default();
     if (config->draft_min_p > 0) e->draft_min_p = config->draft_min_p;
-    // ENGINE_DRAFT_MAX and ENGINE_DRAFT_MIN_P: the same limits from the environment, for experiments.
-    if (const char *v = std::getenv("ENGINE_DRAFT_MAX")) {
-      const long n = std::strtol(v, nullptr, 10);
-      if (n > 0) e->draft_max = std::min({(uint32_t)n, (uint32_t)STEP_MAX_RUN - 1, e->model->draft_max_cap()});
-    }
-    if (const char *v = std::getenv("ENGINE_DRAFT_MIN_P")) {
-      const double p = std::strtod(v, nullptr);
-      if (p > 0) e->draft_min_p = p;
-    }
     e->swaps = opt.adapt_swaps;
     // The rounds until one chooses nothing, before any request: a load's first round can record the prompt path's copy
     // list again, and a request behind that round would wait for it.
