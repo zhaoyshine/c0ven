@@ -238,9 +238,12 @@ void Model::record_prompt_copy(Card &card) {
   }
 }
 
-// Every card has a staging buffer or none, as every card stages the same experts.
+// Every card has a staging buffer or none, as every card stages the same experts. Alchemist fetches every chunk:
+// the recorded copy list's region copies from the arena corrupt the staged experts there, where the CPU's copies
+// through the mapping are correct (run-on-an-arc-a770.md).
 uint32_t Model::fetch_rows() const {
-  return cards_.empty() || !cards_[0]->pc || !cards_[0]->pc->stage_cpu ? 0 : kFetchRows;
+  if (cards_.empty() || !cards_[0]->pc || !cards_[0]->pc->stage_cpu) return 0;
+  return rt_->cards()[0].peer_kernel_access ? kFetchRows : tmax_;
 }
 
 // The chunk's list copies each layer's routing counts to P.routed and signals kRouted after p_moe_count; it waits
@@ -484,7 +487,7 @@ ze::List &Model::prompt_list(Card &card, uint32_t T, uint32_t runs) {
   // cards: card c keeps R for rows r0 .. r1 - 1 (prows_[c] of them) and sends the other card its rows of the mixed x
   // (event kMix). Before, both cards compute every row, as the PLE module's convolution reads across rows.
   const bool split = C > 1 && T >= kHcSplitRows;
-  const bool fetch = T <= kFetchRows && P.stage_cpu;  // the host fetches the uncached experts (fetch_experts)
+  const bool fetch = T <= fetch_rows() && P.stage_cpu;  // the host fetches the uncached experts (fetch_experts)
   const uint32_t cpu_rows = fetch && P.xg_host ? kCpuRows : 0;
   const uint32_t half = split ? T / 2 : T;
   uint32_t r0 = 0, r1 = T;  // this card's rows, all of them until the split
@@ -736,7 +739,7 @@ std::vector<std::vector<Candidate>> Model::prompt_runs(const PromptRun *runs, ui
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), copy_count_);
   }
   const uint32_t T = bucket(n, tmax_), R = nruns > 1 ? PROMPT_MAX_RUNS : 1;
-  const bool fetch = T <= kFetchRows && cards_[0]->pc->stage_cpu;
+  const bool fetch = T <= fetch_rows() && cards_[0]->pc->stage_cpu;
   std::vector<ze::List *> lists;
   for (auto &card : cards_) {
     lists.push_back(&prompt_list(*card, T, R));

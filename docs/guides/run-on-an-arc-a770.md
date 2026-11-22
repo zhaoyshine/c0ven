@@ -52,14 +52,14 @@ uv run python -m frontend \
     --model ~/c0ven-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
     --slots 1 --context 32768 \
     --engine-arg=--checkpoints=0 \
-    --engine-arg=--no-vision \
-    --engine-arg=--chunk-rows=1024
+    --engine-arg=--no-vision
 ```
 
 `--checkpoints=0` keeps the plan inside 31 GiB of host memory. `--no-vision` is required: the image encoder is built
-for 16-lane XMX units, and the Alchemist build leaves it out. `--chunk-rows=1024` is a workaround for a known fault:
-a prompt over 1,024 tokens runs the engine through its staged-expert copy list, which corrupts the model's output on
-Alchemist (an issue to be fixed); chunks of 1,024 rows take the fetch path instead and decode correctly.
+for 16-lane XMX units, and the Alchemist build leaves it out. A chunk of any size stages its experts with the CPU's
+copies through the mapping: the recorded copy list's region copies from the arena corrupt the staged experts there,
+so the cards read wrong weights from the first uncached expert on. The card picks the path (`Model::fetch_rows`), so
+`--chunk-rows` needs no cap.
 
 The load prints `drafting 1` when `dflash/` was found. It takes about 70 seconds. `curl -s localhost:8080/health`
 prints the state.
