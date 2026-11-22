@@ -5,6 +5,11 @@ engine_add_kernel_module(common SOURCE kernels/common.cl)
 # The same for the decode steps of up to 8 rows (STEP_NARROW_ROWS, shared/step.h).
 engine_add_kernel_module(common_r8 SOURCE kernels/common.cl OPTIONS -DSTEP_ROWS=8)
 engine_add_kernel_module(gemm_f16 SOURCE kernels/gemm.cl OPTIONS -cl-intel-256-GRF-per-thread)
+# Alchemist's prompt products at a 128 x 128 work-group tile through local memory (kernels/gemm_big.cl).
+engine_add_kernel_module(gemm_big SOURCE kernels/gemm_big.cl OPTIONS -cl-intel-256-GRF-per-thread)
+# The big tile's operands in the DPAS layout (kernels/pack.cl).
+engine_add_kernel_module(gemm_big_bf16 SOURCE kernels/gemm_big.cl OPTIONS -DBIG_BF16 -cl-intel-256-GRF-per-thread)
+engine_add_kernel_module(pack SOURCE kernels/pack.cl OPTIONS -cl-intel-256-GRF-per-thread)
 engine_add_kernel_module(gemm_bf16 SOURCE kernels/gemm.cl OPTIONS -DBF16 -cl-intel-256-GRF-per-thread)
 # bf16 with tiles of 4 tokens, for the prompt's products whose K or N is short (kernels/gemm.cl).
 engine_add_kernel_module(gemm_bf16_t4n2 SOURCE kernels/gemm.cl

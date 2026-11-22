@@ -88,6 +88,42 @@ REQD_SG __kernel void dequant_f16(__global const uchar *W, uint rows, uint bpr, 
   }
 }
 
+// As dequant_f16, the 32 values of a unit to the DPAS B layout gemm_big_p reads: [row group][K / 16 step][64], word
+// 8 c + lane, lane this row group's row, c the K pair. One sub-group: 8 rows, one unit; a block write a 16-value step.
+#ifdef ENGINE_DG2
+#define DQ_ATTR REQD_SG8
+#define DQ_LANES SG8
+#else
+#define DQ_ATTR REQD_SG
+#define DQ_LANES SG_SIZE
+#endif
+DQ_ATTR __kernel void dequant_f16_p(__global const uchar *W, uint rows, uint bpr, uint b0, uint units,
+                                    __global uint *out, uint ksteps, __global const uchar *grids) {
+  LOAD_GRID(grids)
+  const uint lane = sg_lane();
+  const uint sg = get_group_id(0), rg = sg / units, u = sg % units, r = rg * DQ_LANES + lane;
+  uint p[16];
+  for (uint j = 0; j < 16; j++) p[j] = 0;
+  if (r < rows) {
+    const uint rr = r;
+    const ulong n = (ulong)rows * bpr;
+    uint w[8];
+    float lo, hi, mn, mh;
+    decode_unit(W, n, (ulong)rr * bpr + b0 + u / UNITS_PER_BLOCK, u % UNITS_PER_BLOCK, w, &lo, &hi, &mn, &mh GRID_ARG);
+    for (uint j = 0; j < 16; j++) {
+      float sc = j < 8 ? lo : hi, m = j < 8 ? mn : mh;
+      float v0 = sc * (float)(char)((w[j / 2] >> (16 * (j & 1))) & 0xff) - m;
+      float v1 = sc * (float)(char)((w[j / 2] >> (16 * (j & 1) + 8)) & 0xff) - m;
+      p[j] = (uint)as_ushort(convert_half(v0)) | ((uint)as_ushort(convert_half(v1)) << 16);
+    }
+  }
+  // The stage's two 16-value steps: component c of this lane goes to word 8 c + lane.
+  intel_sub_group_block_write8(out + ((size_t)(rg * ksteps + 2 * u)) * 64,
+                              as_uint8(as_int8((int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]))));
+  intel_sub_group_block_write8(out + ((size_t)(rg * ksteps + 2 * u + 1)) * 64,
+                              as_uint8(as_int8((int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]))));
+}
+
 // The tile's weights: an expert in a cache slot (runs layout) or in a staging slot (file layout).
 static inline __global const uchar *tile_base(__global const uchar *base, ulong slot_bytes, MoeTile t) {
   return base + (ulong)t.slot * slot_bytes;
@@ -113,6 +149,13 @@ QG_KERNEL_SG __kernel void moe_gate_up_t(__global const uchar *base, ulong slot_
   float8 ag[MT], au[MT];
   for (uint i = 0; i < MT; i++) ag[i] = au[i] = (float8)0.0f;
   const uint units = K / 32;
+#ifdef ENGINE_DG2
+  // The tile's 64 tokens, a unit of K at a time, in the DPAS A layout: the work-group's sub-groups share one copy
+  // (word 8 m + lane: token m, the pair at 2 lane), where each read one from global before.
+  __local uint lxa[1024];
+  const uint wi = get_local_id(1) * get_local_size(0) + get_local_id(0);
+  const uint nwi = get_local_size(0) * get_local_size(1);
+#endif
 #ifdef HAS_BLOCK_RAW
   const half tbl = raw_table(GRID_ONLY_ARG);
   uint8 bg = block_raw(G, n, (ulong)rr * bpr), bu = block_raw(U, n, (ulong)rr * bpr);
@@ -163,13 +206,20 @@ QG_KERNEL_SG __kernel void moe_gate_up_t(__global const uchar *base, ulong slot_
     decode_pairs_own(U, n, k, u % UNITS_PER_BLOCK, b2 GRID_ARG);
 #endif
 #ifdef ENGINE_DG2
+    for (uint w = wi; w < 1024; w += nwi) {
+      const uint l_ = w & 7, m_ = (w >> 3) & 7, h_ = (w >> 6) & 1, i_ = w >> 7;
+      const uint row = t.start + 8 * i_ + m_;
+      lxa[w] = row < t.start + t.count ? *(__global const uint *)&X[(ulong)row * ldx + 32 * u + 16 * h_ + 2 * l_] : 0u;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
     // One A tile at a time, for gate and up together: the 8-row tile's registers reach only as far as the two calls.
     for (uint h = 0; h < 2; h++)
       for (uint i = 0; i < MT; i++) {
-        const int8 av = sg_load_a8(X, t.start + 8 * i, ldx, 32 * u + 16 * h, t.start + t.count, lane);
+        const int8 av = as_int8(intel_sub_group_block_read8(lxa + (i * 2 + h) * 64));
         ag[i] = QG_DPAS(av, b[h], ag[i]);
         au[i] = QG_DPAS(av, b2[h], au[i]);
       }
+    barrier(CLK_LOCAL_MEM_FENCE);
 #else
     for (uint h = 0; h < 2; h++)
       for (uint i = 0; i < MT; i++) au[i] = dpas_f16(as_short8(vload8(i, a[h])), b[h], au[i]);
@@ -189,7 +239,8 @@ QG_KERNEL_SG __kernel void moe_gate_up_t(__global const uchar *base, ulong slot_
 // down_tile: moe_down_t for one tile, in nt dpas tiles of 8 assignments. Types with raw_words load the next unit's
 // fields while they decode this one, as raw_pairs' types do. y goes out by 2D block writes when Y allows them.
 static inline void down_tile(MoeTile t, __global const uchar *D, uint rows, uint bpr, uint b0,
-                             __global const ushort *Hin, uint K, __global half *Y, const uint nt GRID_PARAM) {
+                             __global const ushort *Hin, uint K, __global half *Y, const uint nt GRID_PARAM,
+                             __local uint *lxa, uint wi, uint nwi) {
   const uint lane = sg_lane();
   const uint r0 = (get_group_id(0) * QG_SG + sg_id()) * QG_LANES, r = r0 + lane;
   const uint rr = min(r, rows - 1);
@@ -231,11 +282,20 @@ static inline void down_tile(MoeTile t, __global const uchar *D, uint rows, uint
     decode_pairs_own(D, n, (ulong)rr * bpr + ub / UNITS_PER_BLOCK, ub % UNITS_PER_BLOCK, b GRID_ARG);
 #endif
 #ifdef ENGINE_DG2
+    for (uint w = wi; w < 1024; w += nwi) {
+      const uint l_ = w & 7, m_ = (w >> 3) & 7, h_ = (w >> 6) & 1, i_ = w >> 7;
+      const uint row = t.start + 8 * i_ + m_;
+      lxa[w] = (i_ < nt && row < t.start + t.count)
+                   ? *(__global const uint *)&Hin[(ulong)row * K + 32 * u + 16 * h_ + 2 * l_]
+                   : 0u;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
     for (uint h = 0; h < 2; h++)
       for (uint i = 0; i < nt; i++) {
-        const int8 av = sg_load_a8(Hin, t.start + 8 * i, K, 32 * u + 16 * h, t.start + t.count, lane);
+        const int8 av = as_int8(intel_sub_group_block_read8(lxa + (i * 2 + h) * 64));
         acc[i] = QG_DPAS(av, b[h], acc[i]);
       }
+    barrier(CLK_LOCAL_MEM_FENCE);
 #else
     for (uint h = 0; h < 2; h++)
       for (uint i = 0; i < nt; i++) acc[i] = dpas_f16(as_short8(vload8(i, a[h])), b[h], acc[i]);
@@ -279,8 +339,11 @@ QG_KERNEL_SG __kernel void moe_down_t(__global const uchar *base, ulong slot_byt
   if (get_group_id(1) >= *ntiles) return;
   MoeTile t = tiles[get_group_id(1)];
   __global const uchar *D = tile_base(base, slot_bytes, t) + down_off;
+  __local uint lxa[1024];
+  const uint wi = get_local_id(1) * get_local_size(0) + get_local_id(0);
+  const uint nwi = get_local_size(0) * get_local_size(1);
   if (t.count <= MOE_TILE / 2)
-    down_tile(t, D, rows, bpr, b0, Hin, K, Y, MT / 2 GRID_ARG);
+    down_tile(t, D, rows, bpr, b0, Hin, K, Y, MT / 2 GRID_ARG, lxa, wi, nwi);
   else
-    down_tile(t, D, rows, bpr, b0, Hin, K, Y, MT GRID_ARG);
+    down_tile(t, D, rows, bpr, b0, Hin, K, Y, MT GRID_ARG, lxa, wi, nwi);
 }
