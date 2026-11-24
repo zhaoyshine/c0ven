@@ -172,6 +172,8 @@ Model::Model(const std::string &path, const Options &opt) : opt_(opt), gguf_(pat
   if (!info_.ngram_in_ram) info_.ngram_read_us = ngram_->read_latency_us();
   for (uint32_t c = 0; c < ncards_; c++) info_.copy_bytes_per_s[c] = measure_copy(c);
   events_ = std::make_unique<ze::EventPool>(*rt_, shape_.layers * (2 * ncards_ + 2) + 1 + shape_.attn_layers() * ncards_);
+  // Alchemist: the cards do not see the host's flags, so the host synchronizes each layer's part.
+  layer_sync_ = !rt_->cards()[0].host_flag_polling;
 
   plan_ = static_cast<StepPlan *>(rt_->alloc_host(sizeof(StepPlan)));
   std::memset(plan_, 0, sizeof(StepPlan));
@@ -260,6 +262,7 @@ void Model::load_cards(bool first) {
     card->c = c;
     card->C = ncards_;
     card->up = std::make_unique<ze::List>(*rt_, c, ze::List::immediate);
+    if (layer_sync_) card->stepq = std::make_unique<ze::Queue>(*rt_, c);
     cards_.push_back(std::move(card));
   }
   std::fill(kvs_to_.begin(), kvs_to_.end(), 0);  // the ring starts empty
@@ -272,6 +275,11 @@ void Model::load_cards(bool first) {
   if (df_on_)
     for (auto &card : cards_) load_dflash(*card);
   load_experts(first);
+  if (tmax_ && !cards_.empty() && cards_[0]->pc && cards_[0]->pc->wp) {
+    big_ok_ = big_self_check();
+    std::fprintf(stderr, "engine: big tile %s (check against gemm_f16)\n", big_ok_ ? "on" : "off");
+    std::fflush(stderr);
+  }
   ring_sync();
   std::fprintf(stderr, "engine: read %.2f GB of weights with O_DIRECT in %.2f s%s\n", reader_->bytes_read() / 1e9,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
@@ -919,7 +927,12 @@ void Model::load_card(Card &card) {
   card.ha8 = upload<uint8_t>(card, nullptr, W * shape_.used * a8_bytes(card.ff));
   card.sha8 = upload<uint8_t>(card, nullptr, W * a8_bytes(card.ff));
   card.yo = fbuf(shape_.embd);
-  if (ncards_ > 1) card.xp = upload<float>(card, nullptr, (size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4);
+  if (ncards_ > 1) {
+    card.xp = upload<float>(card, nullptr, (size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4);
+    // Alchemist cannot copy into the other card's memory: the block goes to host and the other card pulls it in.
+    if (!rt_->cards()[card.c].peer_kernel_access)
+      card.xp_stage = static_cast<float *>(rt_->alloc_host((size_t)2 * ncards_ * STEP_MAX_ROWS * shape_.embd * 4));
+  }
 }
 
 // Which experts the cards cache, and the arena of the others for the CPU. Each card holds half of every cached
@@ -1157,6 +1170,77 @@ std::unique_ptr<Model::HostLayer> Model::host_layer(uint32_t l, uint64_t n, cons
   return hl;
 }
 
+// The big tile against gemm_f16, bit for bit, on this driver: a driver that gets the shape or the packed layout wrong
+// is caught at load, and the plain path stays for the process.
+bool Model::big_self_check() {
+  struct Form {
+    uint32_t T, N, K;
+    bool bf;
+  };
+  bool ok = true;
+  const uint32_t c = 0, zero = 0;
+  // The shapes the prompt path's big calls take once the gates go by shape alone: the plain ones and the tails of N
+  // and rows that are not multiples of 128 (kernels/gemm_test.cpp has the larger shapes).
+  for (const Form f : {Form{32, 128, 256, false}, Form{40, 324, 64, false}, Form{37, 513, 320, true},
+                       Form{64, 320, 256, false}}) {
+    const uint32_t ks = f.K / 16, nbw = (f.N + 7) / 8, nbx = (f.T + 7) / 8;
+    const uint64_t wg = (uint64_t)((f.N + 127) / 128) * 16, xg = (uint64_t)((f.T + 127) / 128) * 16;
+    ze::List L(*rt_, c, ze::List::immediate);
+    std::vector<uint16_t> W((size_t)f.N * f.K), X((size_t)f.T * f.K);
+    const uint16_t base = f.bf ? 0x3f80 : 0x3c00;
+    for (size_t i = 0; i < W.size(); i++) W[i] = (uint16_t)(base + (i % 13));
+    for (size_t i = 0; i < X.size(); i++) X[i] = (uint16_t)(base + (i % 7));
+    auto *dW = static_cast<uint16_t *>(rt_->alloc_device(c, W.size() * 2));
+    auto *dX = static_cast<uint16_t *>(rt_->alloc_device(c, X.size() * 2));
+    auto *dT = static_cast<uint32_t *>(rt_->alloc_host(4));
+    const size_t n = (size_t)f.T * f.N;
+    auto *dRef = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dR2 = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dY = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dY2 = static_cast<uint16_t *>(rt_->alloc_device(c, n * 2));
+    auto *dWp = static_cast<uint32_t *>(rt_->alloc_device(c, wg * ks * 64 * 4 + (64u << 10)));
+    auto *dXp = static_cast<uint32_t *>(rt_->alloc_device(c, xg * ks * 64 * 4 + (64u << 10)));
+    *dT = f.T;
+    L.copy(dW, W.data(), W.size() * 2);
+    L.copy(dX, X.data(), X.size() * 2);
+    L.launch(kernel(c, f.bf ? "gemm_bf16" : "gemm_f16", "gemm"),
+             {dW, f.N, f.K, f.K, dX, f.K, dT, (void *)dRef, f.N, 1u, zero, 1.0f, dR2, zero},
+             (f.N + 127) / 128, (f.T + 63) / 64, 1, 64);
+    L.launch(kernel(c, "pack", "pack_b"), {dW, f.N, f.K, ks, dWp}, nbw * ks * 8, 1, 1, 8, 1, 1);
+    L.launch(kernel(c, "pack", "pack_a"), {dX, f.T, f.K, f.K, ks, dXp}, nbx * ks * 8, 1, 1, 8, 1, 1);
+    L.launch(kernel(c, f.bf ? "gemm_big_bf16" : "gemm_big", "gemm_big_p"),
+             {dWp, dXp, f.N, f.K, dT, dY, f.N, 1u, zero, 1.0f, (f.N + 127) / 128, dY2, f.T},
+             ((f.N + 127) / 128) * ((f.T + 127) / 128), 1, 1, 32, 4, 1);
+    L.synchronize();
+    auto *h0 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    auto *h1 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    auto *h3 = static_cast<uint16_t *>(rt_->alloc_host(n * 2));
+    L.copy(h0, dRef, n * 2);
+    L.copy(h1, dY, n * 2);
+    L.copy(h3, dY2, n * 2);
+    L.synchronize();
+    size_t bad = 0, bad2 = 0;
+    for (size_t i = 0; i < n; i++) bad += h0[i] != h1[i], bad2 += h1[i] != h3[i];
+    if (bad || bad2)
+      std::fprintf(stderr, "engine: big tile self-check T %u N %u K %u %s: %zu differ, %zu in Y2\n", f.T, f.N, f.K,
+                   f.bf ? "bf16" : "f16", bad, bad2);
+    ok = ok && bad == 0 && bad2 == 0;
+    rt_->free(h0);
+    rt_->free(h1);
+    rt_->free(h3);
+    rt_->free(dW);
+    rt_->free(dX);
+    rt_->free(dT);
+    rt_->free(dRef);
+    rt_->free(dR2);
+    rt_->free(dY);
+    rt_->free(dY2);
+    rt_->free(dWp);
+    rt_->free(dXp);
+  }
+  return ok;
+}
+
 // y[t] = m x[t] for the *ntok tokens of a8 activations (read when the list runs, at most W), rows of m.rows apart.
 void Model::matvec(ze::List &list, Card &card, const Mat &m, const uint8_t *act, float *y, uint32_t W,
                    const uint32_t *ntok, ze_event_handle_t signal) {
@@ -1186,7 +1270,9 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
   const uint32_t key = kvs ? W : W + kKvsSkipList;
   // Not in order: the launches between L.together(true) and L.together(false) read the same inputs and write their
   // own outputs, so they may run side by side; each other command waits for those before it.
-  auto list = std::make_unique<ze::List>(*rt_, card.c, ze::List::regular, false, false);
+  // layer_sync_: the parts go on one queue, and each ends at a layer's router, where the host reads the routing.
+  auto list = std::make_unique<ze::List>(*rt_, card.c, ze::List::regular, false, false,
+                                         layer_sync_ ? card.stepq.get() : nullptr);
   ze::List &L = *list;
   const uint32_t c = card.c, C = ncards_;
   auto common = [&](const char *name) { return kernel(c, rows_module("common", W), name); };
@@ -1234,8 +1320,16 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
              shape_.hc_dim() / 128, 1, 1, 128);
   };
   // next_norm: the norm of the block that follows, done with the combine, or null.
+  const bool peer_stores = rt_->cards()[c].peer_kernel_access;
   auto exchange = [&](float *partials, uint32_t layer, uint32_t base, const float *inj, const float *next_norm) {
-    if (C > 1) L.wait({(*events_)[ev(layer, base + (1 - c))]});
+    if (C > 1) {
+      L.wait({(*events_)[ev(layer, base + (1 - c))]});
+      if (!peer_stores) {
+        const uint32_t k = base == 0 ? 0 : 1;
+        L.copy(card.xp + ((size_t)k * C + (1 - c)) * STEP_MAX_ROWS * shape_.embd,
+               card.xp_stage + ((size_t)k * C + (1 - c)) * STEP_MAX_ROWS * shape_.embd, (size_t)W * shape_.embd * 4);
+      }
+    }
     const uint32_t lw = shape_.hc_lr + shape_.hc;
     const uint32_t rows_apart = STEP_MAX_ROWS;  // each card's block in ex1_ and ex2_ holds STEP_MAX_ROWS rows
     if (next_norm)
@@ -1251,9 +1345,12 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
   // other's, and the combine reads both in card order, so the sums match. k: 0 the mixer's exchange, 1 the MoE's.
   const bool peer = C > 1 && W > 1;
   auto xp_block = [&](const Card &to, uint32_t k) { return to.xp + ((size_t)k * C + c) * STEP_MAX_ROWS * shape_.embd; };
+  auto xp_stage_block = [&](const Card &to, uint32_t k) {
+    return to.xp_stage + ((size_t)k * C + c) * STEP_MAX_ROWS * shape_.embd;
+  };
   auto send_peer = [&](uint32_t k, uint32_t layer, uint32_t base) {
-    L.copy(xp_block(*cards_[1 - c], k), xp_block(card, k), (size_t)W * shape_.embd * 4,
-           (*events_)[ev(layer, base + c)]);
+    float *dst = peer_stores ? xp_block(*cards_[1 - c], k) : xp_stage_block(*cards_[1 - c], k);
+    L.copy(dst, xp_block(card, k), (size_t)W * shape_.embd * 4, (*events_)[ev(layer, base + c)]);
   };
   auto out_product = [&](const Mat &m, float *p1, uint32_t layer) {
     if (W == 1) {
@@ -1364,6 +1461,10 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
     else
       L.launch(q4("router_group"), {card.rl, Ly.slot_map, card.x, card.ids, card.w, card.slots, nmiss, jobs, plan,
                                     card.groups, card.ngroups}, 1, 1, 1, group_wg(W));
+    L.together(false);
+    // The host reads this layer's routing next.
+    if (layer_sync_) L.split();
+    L.together(true);
     L.launch(q4("swiglu_a8"), {card.shg, card.shu, card.ff, plan, card.sha8}, (card.ff / 32 + 3) / 4, W, 1, 64);
     L.together(false);
     if (nslots_cached_ > 0) {
@@ -1400,7 +1501,14 @@ void Model::record(Card &card, uint32_t W, bool kvs) {
     } else {
       matvec(L, card, Ly.sh_down, card.sha8, card.s, W, nrows);
     }
-    if (c == 0) L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
+    // layer_sync_: the cached experts above run while the host computes this layer's misses; the host starts the part
+    // that needs its answers with an event. One event for each layer, signalled by the host once its answers are in.
+    if (layer_sync_) {
+      L.split();
+      if (c == 0) L.wait({(*events_)[ev(l, 2 * ncards_)]});
+    } else if (c == 0) {
+      L.launch(q4("cpu_wait"), {nmiss, ans_seq_ + 16 * l, plan, stuck_}, 1, 1, 1, 1);
+    }
     float *p2 = ex2_ + l * ex_layer + (size_t)c * STEP_MAX_ROWS * shape_.embd;
     const float *cpu = c == 0 ? cpu_y_ + (size_t)l * STEP_MAX_ROWS * shape_.embd : nullptr;
     if (peer) {
@@ -1584,7 +1692,14 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
     if (first) set_rope(rows[r].slot, rows[r].pos, true);
   }
   for (uint32_t i = 0; i < events_->size(); i++) ZE_CHECK(zeEventHostReset((*events_)[i]));
-  for (uint32_t c = ncards_; c-- > 0;) cards_[c]->lists.at(key)->execute();
+  ze::List *card0_list = cards_[0]->lists.at(key).get();
+  if (layer_sync_)
+    // A layer is three parts: to the router, the cached experts, and what waits for the CPU's answers together with
+    // the next layer's front. The first layer's three are submitted at once.
+    for (auto &card : cards_)
+      for (uint32_t p = 0; p < 3; p++) card->lists.at(key)->execute_part(p);
+  else
+    for (uint32_t c = ncards_; c-- > 0;) cards_[c]->lists.at(key)->execute();
   // The n-gram rows, all read at once while the cards run layer 0 (ADR-0015); they wait for the event before layer 1.
   {
     int32_t t[STEP_MAX_ROWS], p1[STEP_MAX_ROWS], p2[STEP_MAX_ROWS];
@@ -1598,18 +1713,23 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
   std::vector<float> xs((size_t)n * E);
   const uint32_t step = plan_->step;
   for (uint32_t l = 0; l < shape_.layers; l++) {
-    // The layer's records (ADR-0011): spin until card 0 publishes each row's for this step; then all the rows'
-    // misses at once, each expert's weights read once.
+    // The layer's records: the part ending at this layer's router, or card 0's publish of each row's, for this
+    // step; then all the rows' misses at once, each expert's weights read once.
+    // layer_sync_: once the part's fence is down, the routing is in host memory.
+    // layer_sync_: part 2l ends at this layer's router, its 2l+1 is the cached experts, submitted already.
+    if (layer_sync_) card0_list->synchronize_part(2 * l);
     jobs.clear();
     HostLayer &hl = *host_layers_[l];
     for (uint32_t r = 0; r < n; r++) {
       MissJob &J = jobs_[(size_t)l * STEP_MAX_ROWS + r];
-      std::atomic_ref<uint32_t> seq(J.seq);
-      auto t0 = std::chrono::steady_clock::now();
-      for (uint32_t k = 0; seq.load(std::memory_order_acquire) != step; k++) {
-        _mm_pause();
-        if ((k & 0xffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
-          throw std::runtime_error("card 0 did not publish layer " + std::to_string(l) + "'s experts");
+      if (!layer_sync_) {
+        std::atomic_ref<uint32_t> seq(J.seq);
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t k = 0; seq.load(std::memory_order_acquire) != step; k++) {
+          _mm_pause();
+          if ((k & 0xffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
+            throw std::runtime_error("card 0 did not publish layer " + std::to_string(l) + "'s experts");
+        }
       }
       const uint32_t nm = J.nmiss;
       if (opt_.adapt_swaps) note_routing(l, J.all, shape_.used, prompt ? kPromptRouting : 1.0f);
@@ -1617,14 +1737,26 @@ std::vector<std::vector<Candidate>> Model::step(const StepIn *rows, uint32_t n, 
       std::memcpy(xs.data() + (size_t)r * E, J.x, E * 4);
       for (uint32_t k = 0; k < nm; k++) jobs.push_back({hl.weights[J.ids[k]], r, J.w[k]});
     }
-    if (jobs.empty()) continue;
-    stats_.misses += (uint32_t)jobs.size();
-    stats_.layers_missed++;
-    cpu_->compute_many(hl.shape, jobs, n, xs.data(), E, cpu_y_ + (size_t)l * STEP_MAX_ROWS * E, E);
-    std::atomic_ref<uint32_t>(ans_seq_[16 * l]).store(step, std::memory_order_release);
+    if (!jobs.empty()) {
+      stats_.misses += (uint32_t)jobs.size();
+      stats_.layers_missed++;
+      cpu_->compute_many(hl.shape, jobs, n, xs.data(), E, cpu_y_ + (size_t)l * STEP_MAX_ROWS * E, E);
+      if (!layer_sync_) std::atomic_ref<uint32_t>(ans_seq_[16 * l]).store(step, std::memory_order_release);
+    }
+    // layer_sync_: the answers are in; let the layer's tail run, while the cards start the next layer's parts.
+    if (layer_sync_) {
+      ZE_CHECK(zeEventHostSignal((*events_)[ev(l, 2 * ncards_)]));
+      if (l + 1 < shape_.layers)
+        for (auto &card : cards_)
+          for (uint32_t p = 2 * l + 3; p <= 2 * l + 4; p++) card->lists.at(key)->execute_part(p);
+    }
   }
-  for (auto &card : cards_) card->lists.at(key)->synchronize();
-  if (*stuck_) throw std::runtime_error("card 0 gave up waiting for the CPU's experts");
+  if (layer_sync_) {
+    for (auto &card : cards_) card->lists.at(key)->synchronize_part(2 * shape_.layers);
+  } else {
+    for (auto &card : cards_) card->lists.at(key)->synchronize();
+    if (*stuck_) throw std::runtime_error("card 0 gave up waiting for the CPU's experts");
+  }
   if (kvs) {
     // The claim may have taken any other slot's pages; a step's slot that read every cell is claimed through its
     // position and kKvsAhead pages past it (one past the indexer's width claimed only the cells it chose).

@@ -2,6 +2,7 @@
 
 #include "library.h"
 
+#include <immintrin.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -35,6 +36,13 @@ std::vector<uint8_t> read_file(const std::string &path) {
   return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+void flush_cpu_writes(void *p, size_t bytes) {
+  if (!bytes) return;
+  const uintptr_t begin = (uintptr_t)p & ~(uintptr_t)63, end = ((uintptr_t)p + bytes + 63) & ~(uintptr_t)63;
+  for (uintptr_t line = begin; line < end; line += 64) _mm_clflush((const void *)line);
+  _mm_sfence();
+}
+
 ze_result_t init() {
   // compute-runtime reads these keys only with NEOReadDebugKeys set. A value already in the environment wins.
   setenv("NEOReadDebugKeys", "1", 0);
@@ -65,6 +73,13 @@ Runtime::Runtime(uint32_t min_cards) {
       c.max_alloc = p.maxMemAllocSize;
       c.device_id = p.deviceId;
       c.ip_version = ipv.ipVersion;
+      // Xe-HPG (Alchemist, IP 12.55) maps a dma-buf write-back; Battlemage maps it write-combining.
+      c.writeback_mapping = ((c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55);
+      // A kernel's store into the other card's memory is dropped on Alchemist (measured on two A770s); the engine keeps
+      // those exchange buffers in host memory there.
+      c.peer_kernel_access = !((c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55);
+      const bool hpg = (c.ip_version >> 22) == 12 && ((c.ip_version >> 14) & 0xff) == 55;
+      c.host_flag_polling = !hpg;
       c.xe_cores = p.numSlices * p.numSubslicesPerSlice;
       c.timer_hz = p.timerResolution;  // cycles per second, with the 1.2 properties
       c.timestamp_mask = p.timestampValidBits >= 64 ? ~0ull : ((1ull << p.timestampValidBits) - 1);
@@ -325,6 +340,16 @@ Library::Library(Runtime &rt, std::string dir, std::string spirv_dir)
     struct stat st;
     const std::string ip = card.ip();
     const bool built = !ip.empty() && ::stat((dir_ + "/" + ip).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (!built && !force && ip.rfind("12.55", 0) == 0) {
+      // An Alchemist card against a Battlemage SPIR-V set: its 2D block reads and 16-lane DPAS misbehave at run time,
+      // silently or as a lost device. Refuse it where the fallback set is the portable one.
+      struct stat mark;
+      if (::stat((spirv_dir_ + "/.dg2").c_str(), &mark) != 0)
+        throw std::runtime_error("card " + std::to_string(c) + " is an Alchemist GPU (" + ip +
+                                 ") and the SPIR-V fallback is not its own variant: build with "
+                                 "-DENGINE_AOT_DEVICES=\"acm-g10;...\" -DENGINE_DG2_DEVICES=acm-g10 "
+                                 "-DENGINE_KERNEL_SPIRV_DEVICE=acm-g10");
+    }
     spirv_.push_back(force || !built);
     if (force)
       std::fprintf(stderr, "engine: card %u: ENGINE_KERNEL_TARGET=spirv, its kernels are compiled at load\n", c);
@@ -391,25 +416,63 @@ EventPool::~EventPool() {
   if (pool_) zeEventPoolDestroy(pool_);
 }
 
-List::List(Runtime &rt, uint32_t card, Kind kind, bool copy_engine, bool in_order)
+Queue::Queue(Runtime &rt, uint32_t card, bool copy_engine) {
+  const Card &c = rt.cards().at(card);
+  ze_command_queue_desc_t qd = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+  qd.ordinal = copy_engine && c.copy_ordinal != UINT32_MAX ? c.copy_ordinal : c.compute_ordinal;
+  qd.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+  qd.flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+  ZE_CHECK(zeCommandQueueCreate(rt.context(), c.device, &qd, &queue_));
+}
+
+Queue::~Queue() {
+  if (stuck) return;
+  if (queue_) zeCommandQueueDestroy(queue_);
+}
+
+List::List(Runtime &rt, uint32_t card, Kind kind, bool copy_engine, bool in_order, Queue *share)
     : rt_(rt), card_(card), kind_(kind), in_order_(in_order) {
   const Card &c = rt.cards().at(card);
-  uint32_t ordinal = copy_engine && c.copy_ordinal != UINT32_MAX ? c.copy_ordinal : c.compute_ordinal;
+  ordinal_ = copy_engine && c.copy_ordinal != UINT32_MAX ? c.copy_ordinal : c.compute_ordinal;
   ze_command_queue_desc_t qd = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
-  qd.ordinal = ordinal;
+  qd.ordinal = ordinal_;
   qd.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
   qd.flags = in_order || kind == regular ? ZE_COMMAND_QUEUE_FLAG_IN_ORDER : 0;
   if (kind == immediate) {
-    ZE_CHECK(zeCommandListCreateImmediate(rt.context(), c.device, &qd, &list_));
+    add_part();
   } else {
-    ZE_CHECK(zeCommandQueueCreate(rt.context(), c.device, &qd, &queue_));
-    ze_command_list_desc_t ld = {ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC};
-    ld.commandQueueGroupOrdinal = ordinal;
-    ld.flags = in_order ? ZE_COMMAND_LIST_FLAG_IN_ORDER : 0;
-    ZE_CHECK(zeCommandListCreate(rt.context(), c.device, &ld, &list_));
-    ze_fence_desc_t fd = {ZE_STRUCTURE_TYPE_FENCE_DESC};
-    ZE_CHECK(zeFenceCreate(queue_, &fd, &fence_));
+    if (share) {
+      queue_ = share->handle();
+    } else {
+      ZE_CHECK(zeCommandQueueCreate(rt.context(), c.device, &qd, &queue_));
+      own_queue_ = true;
+    }
+    add_part();
   }
+}
+
+void List::add_part() {
+  const Card &c = rt_.cards().at(card_);
+  ze_command_list_handle_t l = nullptr;
+  if (kind_ == immediate) {
+    ze_command_queue_desc_t qd = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    qd.ordinal = ordinal_;
+    qd.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+    qd.flags = in_order_ ? ZE_COMMAND_QUEUE_FLAG_IN_ORDER : 0;
+    ZE_CHECK(zeCommandListCreateImmediate(rt_.context(), c.device, &qd, &l));
+  } else {
+    ze_command_list_desc_t ld = {ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC};
+    ld.commandQueueGroupOrdinal = ordinal_;
+    ld.flags = in_order_ ? ZE_COMMAND_LIST_FLAG_IN_ORDER : 0;
+    ZE_CHECK(zeCommandListCreate(rt_.context(), c.device, &ld, &l));
+    ze_fence_desc_t fd = {ZE_STRUCTURE_TYPE_FENCE_DESC};
+    ze_fence_handle_t f = nullptr;
+    ZE_CHECK(zeFenceCreate(queue_, &fd, &f));
+    fences_.push_back(f);
+    part_submitted_.push_back(false);
+  }
+  lists_.push_back(l);
+  list_ = l;
 }
 
 #if defined(ENGINE_CHECK_LISTS) || !defined(NDEBUG)
@@ -433,9 +496,9 @@ List::OneUser::~OneUser() {
 
 List::~List() {
   if (stuck) return;
-  if (fence_) zeFenceDestroy(fence_);
-  if (list_) zeCommandListDestroy(list_);
-  if (queue_) zeCommandQueueDestroy(queue_);
+  for (auto f : fences_) zeFenceDestroy(f);
+  for (auto l : lists_) zeCommandListDestroy(l);
+  if (own_queue_ && queue_) zeCommandQueueDestroy(queue_);
 }
 
 void List::launch(ze_kernel_handle_t k, std::initializer_list<Arg> args, uint32_t gx, uint32_t gy, uint32_t gz,
@@ -479,6 +542,14 @@ void List::trace(uint64_t *ts, size_t cap) {
   timestamp(ts);
 }
 
+void List::trace_op(const char *name, uint64_t detail) {
+  if (!trace_ || trace_names_.size() + 1 >= trace_cap_) return;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%s %llu", name, (unsigned long long)detail);
+  trace_names_.push_back(buf);
+  timestamp(trace_ + trace_names_.size());
+}
+
 void List::copy(void *dst, const void *src, size_t bytes, ze_event_handle_t signal,
                 std::initializer_list<ze_event_handle_t> wait) {
   ONE_USER;
@@ -486,6 +557,7 @@ void List::copy(void *dst, const void *src, size_t bytes, ze_event_handle_t sign
   ZE_CHECK(zeCommandListAppendMemoryCopy(list_, dst, src, bytes, signal, (uint32_t)w.size(),
                                          w.empty() ? nullptr : w.data()));
   if (!in_order_) barrier();
+  trace_op("copy", bytes);
 }
 
 void List::copy_rows(void *dst, size_t dst_pitch, const void *src, size_t src_pitch, size_t width, size_t rows) {
@@ -494,31 +566,37 @@ void List::copy_rows(void *dst, size_t dst_pitch, const void *src, size_t src_pi
   ZE_CHECK(zeCommandListAppendMemoryCopyRegion(list_, dst, &region, (uint32_t)dst_pitch, 0, src, &region,
                                                (uint32_t)src_pitch, 0, nullptr, 0, nullptr));
   if (!in_order_) barrier();
+  trace_op("copy_rows", rows);
 }
 
 void List::fill(void *dst, const void *pattern, size_t pattern_size, size_t bytes) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendMemoryFill(list_, dst, pattern, pattern_size, bytes, nullptr, 0, nullptr));
   if (!in_order_) barrier();
+  trace_op("fill", bytes);
 }
 
 void List::wait(std::initializer_list<ze_event_handle_t> events) {
   ONE_USER;
   std::vector<ze_event_handle_t> w(events);
   ZE_CHECK(zeCommandListAppendWaitOnEvents(list_, (uint32_t)w.size(), w.data()));
+  trace_op("wait", w.size());
 }
 
 void List::signal(ze_event_handle_t e) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendSignalEvent(list_, e));
+  trace_op("signal", 0);
 }
 void List::reset(ze_event_handle_t e) {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendEventReset(list_, e));
+  trace_op("reset", 0);
 }
 void List::barrier() {
   ONE_USER;
   ZE_CHECK(zeCommandListAppendBarrier(list_, nullptr, 0, nullptr));
+  trace_op("barrier", 0);
 }
 
 void List::together(bool on) {
@@ -533,28 +611,56 @@ void List::timestamp(uint64_t *dst) {
   ZE_CHECK(zeCommandListAppendWriteGlobalTimestamp(list_, dst, nullptr, 0, nullptr));
 }
 
+void List::split() {
+  ONE_USER;
+  if (kind_ != regular) throw std::runtime_error("split() on an immediate list");
+  ZE_CHECK(zeCommandListClose(list_));
+  add_part();
+}
+
 void List::close() {
   ONE_USER;
   if (kind_ == regular) ZE_CHECK(zeCommandListClose(list_));
-}
-
-void List::execute() {
-  ONE_USER;
-  if (kind_ != regular) throw std::runtime_error("execute() on an immediate list");
-  if (submitted_) ZE_CHECK(zeFenceReset(fence_));
-  ZE_CHECK(zeCommandQueueExecuteCommandLists(queue_, 1, &list_, fence_));
-  submitted_ = true;
 }
 
 // A list on a queue whose engine the driver reset never finishes, and the driver's job timeout does not apply to the
 // engine's long-running queues, so an unbounded wait hangs the process. No list the engine records runs this long.
 constexpr uint64_t kListWaitNs = 60'000'000'000ull;
 
+void List::execute() {
+  ONE_USER;
+  if (kind_ != regular) throw std::runtime_error("execute() on an immediate list");
+  if (submitted_) ZE_CHECK(zeFenceReset(fences_.back()));
+  ZE_CHECK(zeCommandQueueExecuteCommandLists(queue_, (uint32_t)lists_.size(), lists_.data(), fences_.back()));
+  submitted_ = true;
+}
+
+void List::execute_part(uint32_t i) {
+  ONE_USER;
+  if (kind_ != regular || i >= lists_.size()) throw std::runtime_error("execute_part() out of range");
+  if (part_submitted_.at(i)) ZE_CHECK(zeFenceReset(fences_[i]));
+  ZE_CHECK(zeCommandQueueExecuteCommandLists(queue_, 1, &lists_[i], fences_[i]));
+  part_submitted_[i] = true;
+}
+
+void List::synchronize_part(uint32_t i) {
+  ONE_USER;
+  if (kind_ != regular || i >= fences_.size() || !part_submitted_.at(i)) return;
+  const ze_result_t r = zeFenceHostSynchronize(fences_[i], kListWaitNs);
+  if (r == ZE_RESULT_NOT_READY) {
+    stuck = true;
+    throw std::runtime_error("card " + std::to_string(card_) + " did not finish a list in " +
+                             std::to_string(kListWaitNs / 1'000'000'000ull) +
+                             " s; its engine may have been reset (the kernel log, /sys/class/devcoredump)");
+  }
+  check(r, "zeFenceHostSynchronize");
+}
+
 void List::synchronize() {
   ONE_USER;
   if (kind_ != immediate && !submitted_) return;
   const ze_result_t r = kind_ == immediate ? zeCommandListHostSynchronize(list_, kListWaitNs)
-                                           : zeFenceHostSynchronize(fence_, kListWaitNs);
+                                           : zeFenceHostSynchronize(fences_.back(), kListWaitNs);
   if (r == ZE_RESULT_NOT_READY) {
     stuck = true;
     throw std::runtime_error("card " + std::to_string(card_) + " did not finish a list in " +
@@ -566,7 +672,8 @@ void List::synchronize() {
 
 void List::reset_list() {
   ONE_USER;
-  if (kind_ == regular) ZE_CHECK(zeCommandListReset(list_));
+  if (kind_ == regular)
+    for (auto l : lists_) ZE_CHECK(zeCommandListReset(l));
 }
 
 }  // namespace engine::ze

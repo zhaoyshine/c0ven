@@ -274,6 +274,8 @@ class Model final : public engine::Model {
   void matvec(ze::List &list, Card &card, const Mat &m, const uint8_t *act, float *y, uint32_t W, const uint32_t *ntok,
               ze_event_handle_t signal = nullptr);
   ze_kernel_handle_t kernel(uint32_t card, const std::string &module, const std::string &name);
+  bool big_self_check();  // the big tile against gemm_f16, bit for bit, on this driver
+  bool big_ok_ = false;   // it passed: gemm takes kernels/gemm_big.cl's path
   uint32_t ev(uint32_t layer, uint32_t which) const;
   void note_routing(uint32_t layer, const int32_t *ids, uint32_t n, float weight);
   struct SwapPlan {
@@ -356,6 +358,8 @@ class Model final : public engine::Model {
   std::unique_ptr<ze::Runtime> rt_;
   std::unique_ptr<ze::Library> lib_;
   std::unique_ptr<ze::EventPool> events_;
+  // Alchemist: the cards do not see the host's flags, so the host synchronizes each layer's part instead.
+  bool layer_sync_ = false;
   std::unique_ptr<Pool> pool_;
   std::unique_ptr<CpuExperts> cpu_;
   std::unique_ptr<Ngram> ngram_;

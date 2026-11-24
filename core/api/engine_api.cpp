@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>

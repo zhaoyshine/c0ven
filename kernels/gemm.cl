@@ -10,6 +10,18 @@
 #define DPAS dpas_f16
 #endif
 
+#ifdef ENGINE_DG2
+#include "dg2.h"
+#define KERNEL_SG REQD_SG8
+#ifdef BF16
+#define DPAS8 dpas8_bf16
+#else
+#define DPAS8 dpas8_f16
+#endif
+#else
+#define KERNEL_SG REQD_SG
+#endif
+
 // Tile sizes from docs/measurements/MEASUREMENTS.md#2026-10-15-prompt-gemm-tiles; the TM 4 modules are for a short K or N.
 #ifndef TM
 #define TM 8      // tiles of 8 tokens per sub-group, a multiple of 4
@@ -18,7 +30,11 @@
 #define TN 2      // tiles of 16 rows per sub-group
 #endif
 #ifndef GEMM_SG
+#if defined(ENGINE_DG2)
+#define GEMM_SG 8 // sub-groups per work-group, side by side along n: 8 lanes x 8 = 4 lanes-groups of 16
+#else
 #define GEMM_SG 4 // sub-groups per work-group, side by side along n
+#endif
 #endif
 
 static inline float post(float x, uint mode) {
@@ -33,6 +49,14 @@ static inline void gemm_acc(__global const ushort *W, uint N, uint K, uint ldw, 
   for (uint i = 0; i < TM; i++)
     for (uint j = 0; j < TN; j++) acc[i][j] = (float8)0.0f;
   for (uint k = 0; k < K; k += 16) {
+#ifdef ENGINE_DG2
+    int8 b[TN];
+    for (uint j = 0; j < TN; j++) b[j] = sg_load_b8(W, n0 + SG8 * j, ldw, k, N, sg_lane());
+    for (uint i = 0; i < TM; i++) {
+      const int8 av = sg_load_a8(X, t0 + 8 * i, ldx, k, T, sg_lane());
+      for (uint j = 0; j < TN; j++) acc[i][j] = DPAS8(av, b[j], acc[i][j]);
+    }
+#else
     ushort a[8 * TM];
     for (uint i = 0; i < TM / 4; i++) sg_load_rows32(X, K * 2, T, ldx * 2, k, t0 + 32 * i, a + 32 * i);
     uint b[TN][8];
@@ -41,6 +65,7 @@ static inline void gemm_acc(__global const ushort *W, uint N, uint K, uint ldw, 
       short8 av = as_short8(vload8(i, a));
       for (uint j = 0; j < TN; j++) acc[i][j] = DPAS(av, as_int8(vload8(0, b[j])), acc[i][j]);
     }
+#endif
   }
 }
 
@@ -48,7 +73,7 @@ static inline void gemm_acc(__global const ushort *W, uint N, uint K, uint ldw, 
 // K a multiple of 16; W, X 64-byte aligned, rows ldw, ldx elements apart, multiples of 32. Y: f32, or fp16 if yhalf.
 // Y2 (yhalf only, N a multiple of 16 TN): the other card's copy of Y, rows ldy apart, 16-byte aligned. band > 0 runs
 // bands of `band` row blocks, every token block of one before the next. Neither tiles nor bands change a sum's order.
-REQD_SG __kernel void gemm(__global const ushort *W, uint N, uint K, uint ldw, __global const ushort *X, uint ldx,
+KERNEL_SG __kernel void gemm(__global const ushort *W, uint N, uint K, uint ldw, __global const ushort *X, uint ldx,
                            __global const uint *ntok, __global float *Y, uint ldy, uint yhalf, uint mode, float scale,
                            __global ushort *Y2, uint band) {
   const uint lane = sg_lane();
@@ -60,15 +85,58 @@ REQD_SG __kernel void gemm(__global const ushort *W, uint N, uint K, uint ldw, _
     gn = b * band + r % w;
     gt = r / w;
   }
+#ifdef ENGINE_DG2
+  const uint n0 = (gn * GEMM_SG + sg_id()) * (SG8 * TN);
+#else
   const uint n0 = (gn * GEMM_SG + sg_id()) * (16 * TN);
+#endif
   const uint t0 = gt * (8 * TM);
   const uint T = *ntok;
   if (t0 >= T || n0 >= N) return;
   float8 acc[TM][TN];
   gemm_acc(W, N, K, ldw, X, ldx, T, n0, t0, acc);
+  const uint esize = yhalf ? 2 : 4;
+#ifdef ENGINE_DG2
+  // The 2D block store is a Battlemage extension. Each lane stores its own column of the 8 rows. One block write a
+  // token when the row's start is 16-byte aligned: a column group is 8 lanes = 16 bytes, and small stores cross PCIe
+  // slowly (docs/measurements/MEASUREMENTS.md#2026-10-15-prompt-exchange-stores).
+  for (uint i = 0; i < TM; i++) {
+    ushort h[TN][SG8];
+    for (uint j = 0; j < TN; j++) {
+      uint n = n0 + SG8 * j + lane;
+      float r[8];
+      vstore8(acc[i][j], 0, r);
+      for (uint m = 0; m < 8; m++) r[m] = post(r[m] * scale, mode);
+      if (yhalf)
+        for (uint m = 0; m < 8; m++) h[j][m] = as_ushort(convert_half(r[m]));
+      for (uint m = 0; m < 8; m++) {
+        uint t = t0 + 8 * i + m;
+        if (t < T && n < N) {
+          if (yhalf)
+            vstore_half(r[m], (ulong)t * ldy + n, (__global half *)Y);
+          else
+            Y[(ulong)t * ldy + n] = r[m];
+        }
+      }
+    }
+    if (Y2 && yhalf)
+      for (uint m = 0; m < 8; m++) {
+        const uint t = t0 + 8 * i + m;
+        if (t >= T) break;
+        // Block writes need 16-byte-aligned addresses: 8 lanes of 2 bytes at a column group's start.
+        if (ldy % SG8 == 0 && (ulong)Y2 % 16 == 0)
+          for (uint j = 0; j < TN; j++)
+            if (n0 + SG8 * j + lane < N) intel_sub_group_block_write_us(Y2 + (ulong)t * ldy + n0 + SG8 * j, h[j][m]);
+        else
+          for (uint j = 0; j < TN; j++) {
+            const uint n = n0 + SG8 * j + lane;
+            if (n < N) Y2[(ulong)t * ldy + n] = h[j][m];
+          }
+      }
+  }
+#else
   // A tile of 8 tokens x 16 rows goes out by one 2D block store when Y's rows are 64-byte aligned; single-value
   // stores bound a short K's product.
-  const uint esize = yhalf ? 2 : 4;
   const bool block2d = ((ldy * esize) % 64) == 0 && (((ulong)Y) % 64) == 0;
   for (uint i = 0; i < TM; i++) {
     ushort h[TN][8];
@@ -112,4 +180,5 @@ REQD_SG __kernel void gemm(__global const ushort *W, uint N, uint K, uint ldw, _
 #endif
       }
   }
+#endif
 }

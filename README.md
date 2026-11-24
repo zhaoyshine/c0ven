@@ -62,6 +62,9 @@ if you have one, try Strata.
 
 You need a Linux machine with Docker, the `xe` kernel driver and a model. Run each command below in a terminal.
 
+The image's kernels are built for Battlemage cards. For Arc A770 (Alchemist), [build from
+source](docs/guides/run-on-an-arc-a770.md).
+
 ### 1. Check your machine
 
 Check that Docker works. This prints `Hello from Docker!`:

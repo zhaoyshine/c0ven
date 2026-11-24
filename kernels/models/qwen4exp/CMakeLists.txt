@@ -26,8 +26,10 @@ engine_add_kernel_module(qwen4exp_gdn SOURCE kernels/models/qwen4exp/prompt_gdn.
 # The DFlash 2 drafter's kernels between its products (core/models/qwen4exp/dflash.cpp).
 engine_add_kernel_module(qwen4exp_dflash SOURCE kernels/models/qwen4exp/dflash.cl
                          OPTIONS -I${CMAKE_SOURCE_DIR}/core/models/qwen4exp)
-# The image encoder's steps between its products (docs/spec/MODEL_VISION.md).
-engine_add_kernel_module(qwen4exp_vision SOURCE kernels/models/qwen4exp/vision.cl
+# The image encoder's steps between its products (docs/spec/MODEL_VISION.md). The Alchemist build leaves them out:
+# the encoder's kernel is written for the 16-lane XMX units, and a card without that path runs without images
+# (--no-vision).
+engine_add_kernel_module(qwen4exp_vision SKIP_DG2 SOURCE kernels/models/qwen4exp/vision.cl
                          OPTIONS -I${CMAKE_SOURCE_DIR}/core/models/qwen4exp)
-engine_add_kernel_module(qwen4exp_vision_attn SOURCE kernels/models/qwen4exp/vision.cl
+engine_add_kernel_module(qwen4exp_vision_attn SKIP_DG2 SOURCE kernels/models/qwen4exp/vision.cl
                          OPTIONS -cl-intel-256-GRF-per-thread -I${CMAKE_SOURCE_DIR}/core/models/qwen4exp)
